@@ -42,6 +42,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_stream_q4.h"
 #include "ds4_tp.h"
 
 /* Wave-2 multi-GPU types are needed in every build because the engine
@@ -6993,20 +6994,44 @@ static DS4_MAYBE_UNUSED bool laguna_stream_configure_cache(
     return true;
 }
 
-/* One-row scratch mirrors laguna_graph_alloc; KV still spans the context. */
+static DS4_MAYBE_UNUSED bool laguna_stream_prefill_chunk_from_env(
+        uint32_t *chunk_out) {
+    if (!chunk_out) return false;
+    *chunk_out = 1;
+    const char *env = getenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK");
+    if (!env || !env[0]) return true;
+    errno = 0;
+    char *end = NULL;
+    const unsigned long value = strtoul(env, &end, 10);
+    if (errno || end == env || *end != '\0' || value < 1 ||
+        value > DS4_LAGUNA_STREAM_PREFILL_CHUNK_MAX) {
+        return false;
+    }
+    *chunk_out = (uint32_t)value;
+    return true;
+}
+
+/* Only the row buffers scale with the chunk; the KV covers the whole
+ * context. */
 static DS4_MAYBE_UNUSED bool laguna_stream_graph_bytes(
-        uint32_t ctx, uint64_t *kv, uint64_t *scratch) {
+    uint32_t ctx, uint64_t *kv, uint64_t *scratch) {
     if (!ctx || ctx > DS4_CONTEXT_LENGTH) return false;
+    uint32_t rows = 1;
+    if (!laguna_stream_prefill_chunk_from_env(&rows)) return false;
     const uint64_t embd = DS4_N_EMBD;
     const uint64_t q = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t v = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     const uint64_t routed = (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
     const uint64_t ffn = DS4_N_FF_DENSE > routed ? DS4_N_FF_DENSE : routed;
-    *scratch = sizeof(float) * (9 * embd + 2 * q + 2 * v +
-            DS4_N_HEAD + 3 * ffn + routed + 2 * DS4_N_EXPERT +
-            DS4_N_EXPERT_USED + 1 + DS4_N_VOCAB) +
-            sizeof(uint32_t) * (2 + DS4_N_EXPERT_USED) +
-            2 * v * sizeof(uint16_t);
+    const uint64_t per_row = sizeof(float) * (8 * embd + 2 * q + 2 * v +
+        DS4_N_HEAD + 3 * ffn + routed + 2 * DS4_N_EXPERT +
+        DS4_N_EXPERT_USED) +
+        sizeof(uint32_t) * (1 + DS4_N_EXPERT_USED) +
+        2 * v * sizeof(uint16_t);
+    const uint64_t fixed = sizeof(float) * (embd + 1 + DS4_N_VOCAB) +
+        sizeof(uint32_t);
+    if (per_row > (UINT64_MAX - fixed) / rows) return false;
+    *scratch = per_row * rows + fixed;
     *kv = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         uint32_t cap = ds4_laguna_layer_is_swa(il) ? DS4_N_SWA : ctx;
@@ -48092,7 +48117,8 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size,
     g->ctx_size = ctx_size;
     g->prefill_cap = ctx_size < 16384u ? ctx_size : 16384u;
     g->ssd_streaming = ssd_streaming;
-    if (ssd_streaming) g->prefill_cap = 1;
+    if (ssd_streaming &&
+        !laguna_stream_prefill_chunk_from_env(&g->prefill_cap)) return false;
 
     const uint64_t f32 = sizeof(float);
     const uint64_t rows = g->prefill_cap;
@@ -49910,15 +49936,20 @@ static bool laguna_graph_forward_batch(
         for (uint32_t i = 0; i < n_tokens; i++) {
             if (tokens[i] < 0 || tokens[i] >= (int)DS4_N_VOCAB) return false;
         }
-        for (uint32_t i = 0; i < n_tokens; i++) {
-            if (!laguna_graph_forward_token(g, model, weights, tokens[i],
-                    pos0 + i, NULL, i + 1u == n_tokens ? logits_out : NULL))
-                return false;
-            laguna_graph_report_prefill_display_progress(
-                    display_progress, display_progress_ud, pos0 + i, 1,
-                    DS4_N_LAYER, display_total, true);
+        /* The streaming batch consumer needs at least two rows, so a single
+         * row (including a one-token prefill remainder) takes the decode
+         * path, which is also the numerically exact one. */
+        if (g->prefill_cap == 1u || n_tokens == 1u) {
+            for (uint32_t i = 0; i < n_tokens; i++) {
+                if (!laguna_graph_forward_token(g, model, weights, tokens[i],
+                        pos0 + i, NULL, i + 1u == n_tokens ? logits_out : NULL))
+                    return false;
+                laguna_graph_report_prefill_display_progress(
+                        display_progress, display_progress_ud, pos0 + i, 1,
+                        DS4_N_LAYER, display_total, true);
+            }
+            return true;
         }
-        return true;
     }
     if (n_tokens > g->prefill_cap) return false;
     if (row_argmax_out &&
@@ -49995,7 +50026,12 @@ static bool laguna_graph_forward_batch(
      * reflects GPU work that has actually completed.  Tiny suffixes keep the
      * lower-overhead single-command path. */
     const bool live_progress = display_progress != NULL && n_tokens >= 32u;
-    const bool exact_q8_rows = row_argmax_out != NULL;
+    const bool replay_decode_rows = row_argmax_out != NULL;
+    /* Block streaming must keep the Q8 reduction order of the single-row path:
+     * the r1_N variants change the routers of later layers enough to amplify
+     * the error. The router and the experts stay batched, so the SSD union is
+     * still loaded once per layer. */
+    const bool exact_q8_rows = replay_decode_rows || g->ssd_streaming;
     if (gpu_draft_tokens) {
         ok = gpu_draft_pipeline_ready;
     } else {
@@ -50076,7 +50112,7 @@ static bool laguna_graph_forward_batch(
                                                  n_tokens,
                                                  exact_q8_rows);
         }
-        if (ok && exact_q8_rows) {
+        if (ok && replay_decode_rows) {
             failed_stage = "Q/K norm/RoPE";
             ok = ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
                     g->q,
@@ -50244,7 +50280,7 @@ static bool laguna_graph_forward_batch(
                                         (uint64_t)n_tokens * DS4_N_EMBD) != 0;
             }
         } else if (ok) {
-            if (exact_q8_rows) {
+            if (replay_decode_rows) {
                 failed_stage = "decode-row router";
                 ok = laguna_graph_router_decode_rows(
                         g, model, l, n_tokens);
@@ -50260,7 +50296,7 @@ static bool laguna_graph_forward_batch(
                         g->ffn_norm,
                         n_tokens) != 0;
             }
-            if (ok && !exact_q8_rows) {
+            if (ok && !replay_decode_rows) {
                 failed_stage = "router selection";
                 ok = ds4_gpu_glm_router_select_batch_tensor(
                         g->router_selected,
@@ -50290,7 +50326,7 @@ static bool laguna_graph_forward_batch(
                 l->ffn_down_exps->dim[1] * down_row_bytes;
             if (ok) {
                 failed_stage = "routed experts";
-                if (exact_q8_rows) {
+                if (replay_decode_rows) {
                     ok = laguna_graph_routed_moe_decode_rows(
                             g,
                             model,
@@ -50304,7 +50340,7 @@ static bool laguna_graph_forward_batch(
                             down_expert_bytes,
                             down_row_bytes);
                 } else {
-                    ok = ds4_gpu_glm_routed_moe_batch_tensor(
+                    ok = ds4_gpu_laguna_routed_moe_batch_tensor(
                             g->ffn_out,
                             g->routed_mid,
                             model->map,
@@ -59626,6 +59662,14 @@ static bool laguna_stream_engine_configure(ds4_engine *e, int context_size) {
     const uint64_t span_bytes = model_map_span_vec_total_bytes(&spans);
     free(spans.v);
     const uint32_t ctx = context_size > 0 ? (uint32_t)context_size : 4096u;
+    uint32_t prefill_chunk = 1;
+    if (!laguna_stream_prefill_chunk_from_env(&prefill_chunk)) {
+        const char *value = getenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK");
+        fprintf(stderr, "ds4: invalid DS4_LAGUNA_STREAM_PREFILL_CHUNK=%s; "
+                        "expected an integer in 1..%u\n",
+                value ? value : "", DS4_LAGUNA_STREAM_PREFILL_CHUNK_MAX);
+        return false;
+    }
     const uint64_t recommended = ds4_gpu_recommended_working_set_size();
     const uint64_t available = laguna_stream_available_cache_bytes(
             recommended, span_bytes, ctx);
@@ -59640,6 +59684,18 @@ static bool laguna_stream_engine_configure(ds4_engine *e, int context_size) {
                 (double)available / 1073741824.0);
         return false;
     }
+    const uint32_t required_cache =
+        ds4_laguna_stream_prefill_required_cache(prefill_chunk);
+    if (!ds4_laguna_stream_prefill_cache_admitted(prefill_chunk,
+                                                   cache.experts)) {
+        fprintf(stderr, "ds4: Laguna SSD streaming prefill chunk %u requires "
+                        "cache capacity >= %u experts (%u rows x top-10 + "
+                        "%u margin); configured %u\n",
+                prefill_chunk, required_cache, prefill_chunk,
+                prefill_chunk == 1 ? 0u : DS4_LAGUNA_STREAM_PREFILL_MARGIN,
+                cache.experts);
+        return false;
+    }
     uint64_t kv = 0, scratch = 0;
     if (!laguna_stream_graph_bytes(ctx, &kv, &scratch)) return false;
     e->ssd_streaming_cache_experts = cache.experts;
@@ -59651,8 +59707,8 @@ static bool laguna_stream_engine_configure(ds4_engine *e, int context_size) {
             cache.experts, (double)cache.payload_bytes / 1048576.0,
             (double)non_routed / 1048576.0, (double)routed / 1048576.0,
             (double)kv / 1048576.0, (double)scratch / 1048576.0, ctx);
-    fprintf(stderr, "ds4: Laguna SSD streaming: sequential prefill, "
-            "required Q4 cache; no resident routed fallback\n");
+    fprintf(stderr, "ds4: Laguna SSD streaming: prefill chunk=%u, "
+            "required Q4 cache; no resident routed fallback\n", prefill_chunk);
     return true;
 }
 

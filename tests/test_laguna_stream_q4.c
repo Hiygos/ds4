@@ -75,9 +75,46 @@ static void run_case(bool rectangular) {
     fixture_close(&f);
 }
 
+static void test_prefill_union_and_admission(void) {
+    int32_t ids[4 * DS4_STREAM_Q4_MAX_SELECTED];
+    for (uint32_t row = 0; row < 4; row++)
+        for (uint32_t col = 0; col < DS4_STREAM_Q4_MAX_SELECTED; col++)
+            ids[row * DS4_STREAM_Q4_MAX_SELECTED + col] =
+                (int32_t)(col + (row % 2u) * 5u);
+    int32_t unique[256] = {0};
+    uint32_t count = 0;
+    assert(ds4_laguna_stream_prefill_union(ids, 4,
+            DS4_STREAM_Q4_MAX_SELECTED, 256, unique, 256, &count));
+    assert(count == 15);
+    for (uint32_t i = 0; i < count; i++) assert(unique[i] == (int32_t)i);
+
+    ids[17] = 256;
+    assert(!ds4_laguna_stream_prefill_union(ids, 4,
+            DS4_STREAM_Q4_MAX_SELECTED, 256, unique, 256, &count));
+    ids[17] = 12;
+    assert(!ds4_laguna_stream_prefill_union(ids, 0,
+            DS4_STREAM_Q4_MAX_SELECTED, 256, unique, 256, &count));
+    assert(!ds4_laguna_stream_prefill_union(ids, 4, 8,
+            256, unique, 256, &count));
+
+    assert(ds4_laguna_stream_prefill_required_cache(1) == 10);
+    assert(ds4_laguna_stream_prefill_required_cache(2) == 30);
+    assert(ds4_laguna_stream_prefill_required_cache(4) == 50);
+    assert(ds4_laguna_stream_prefill_required_cache(8) == 90);
+    assert(ds4_laguna_stream_prefill_required_cache(32) == 330);
+    assert(ds4_laguna_stream_prefill_required_cache(0) == 0);
+    assert(ds4_laguna_stream_prefill_required_cache(33) == 0);
+    assert(ds4_laguna_stream_prefill_cache_admitted(1, 10));
+    assert(!ds4_laguna_stream_prefill_cache_admitted(2, 29));
+    assert(ds4_laguna_stream_prefill_cache_admitted(2, 30));
+    assert(!ds4_laguna_stream_prefill_cache_admitted(8, 89));
+    assert(ds4_laguna_stream_prefill_cache_admitted(8, 90));
+}
+
 int main(void) {
     run_case(false);
     run_case(true);
-    puts("laguna-stream-q4-host: OK (square/rectangular, distinct rows, top-10, bounds, overflow, budget)");
+    test_prefill_union_and_admission();
+    puts("laguna-stream-q4-host: OK (square/rectangular, top-10, union/dedup, admission)");
     return 0;
 }

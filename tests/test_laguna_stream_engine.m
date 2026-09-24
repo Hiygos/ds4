@@ -36,6 +36,11 @@ static void check_closed(int old_fd) {
     assert(!g_stream_expert_cache_free_slot_count && !g_laguna_stream_allocated_bytes);
     assert(!g_laguna_stream_buffers && !g_laguna_stream_free_buffers);
     assert(!g_laguna_stream_moe_calls && !g_laguna_stream_token_rows);
+    assert(!g_laguna_stream_prefill_chunks &&
+           !g_laguna_stream_prefill_layer_unions &&
+           !g_laguna_stream_prefill_distinct_selected &&
+           !g_laguna_stream_prefill_distinct_loaded &&
+           !g_laguna_stream_prefill_distinct_max);
     assert(!g_test_laguna_stream_temporary_bytes);
     for (unsigned il = 0; il < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; il++)
         for (unsigned id = 0; id < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; id++) {
@@ -109,6 +114,170 @@ static void check_resume(ds4_engine *engine, ds4_session **session, int ctx,
     *session = s;
 }
 
+enum { CHUNK_GREEDY_TOKENS = 4 };
+static const float chunk_reference_gap_tolerance = 1e-2f;
+
+static void top_two_logits(const float *logits, int vocab, int *top1,
+                           int *top2, float *top1_logit, float *top2_logit) {
+    *top1 = *top2 = -1;
+    *top1_logit = *top2_logit = -INFINITY;
+    for (int i = 0; i < vocab; i++) {
+        if (logits[i] > *top1_logit) {
+            *top2 = *top1;
+            *top2_logit = *top1_logit;
+            *top1 = i;
+            *top1_logit = logits[i];
+        } else if (logits[i] > *top2_logit) {
+            *top2 = i;
+            *top2_logit = logits[i];
+        }
+    }
+    assert(*top1 >= 0 && *top2 >= 0);
+}
+
+static void make_chunk_prompt(ds4_engine *engine, bool long_context,
+                              ds4_tokens *prompt) {
+    ds4_chat_begin(engine, prompt);
+    ds4_tokenize_text(engine, "The capital of Italy is", prompt);
+    const int target = long_context ? 517 : 17;
+    ds4_tokens sentence = {0};
+    ds4_tokenize_text(engine,
+        " This is a test of the sliding attention window.", &sentence);
+    assert(sentence.len > 0 && prompt->len > 0 && prompt->len < target);
+    for (unsigned i = 0; prompt->len < target; i++)
+        ds4_tokens_push(prompt, sentence.v[i % sentence.len]);
+    ds4_tokens_free(&sentence);
+    assert(prompt->len == target);
+    assert((prompt->len % 2) && (prompt->len % 4) && (prompt->len % 8));
+}
+
+static void check_chunked_prefill(const char *model_path, int ctx,
+                                  bool long_context) {
+    const uint32_t chunks[] = {0, 1, 2, 4, 8, 16};
+    ds4_tokens prompt = {0};
+    float *reference = NULL;
+    float *unset_final = NULL;
+    int reference_vocab = 0;
+    int reference_tokens[CHUNK_GREEDY_TOKENS] = {0};
+    int unset_tokens[CHUNK_GREEDY_TOKENS] = {0};
+    int reference_top2[CHUNK_GREEDY_TOKENS] = {0};
+    float reference_top1_logits[CHUNK_GREEDY_TOKENS] = {0};
+    float reference_top2_logits[CHUNK_GREEDY_TOKENS] = {0};
+
+    for (unsigned ci = 0; ci < sizeof(chunks) / sizeof(chunks[0]); ci++) {
+        char chunk_text[8];
+        if (chunks[ci] == 0) {
+            assert(unsetenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK") == 0);
+        } else {
+            snprintf(chunk_text, sizeof(chunk_text), "%u", chunks[ci]);
+            assert(setenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK", chunk_text, 1) == 0);
+        }
+        ds4_engine_options opt = {
+            .model_path = model_path,
+            .backend = DS4_BACKEND_METAL,
+            .ssd_streaming = true,
+            .ssd_streaming_cache_bytes = 8ull << 30,
+            .context_size = ctx,
+        };
+        ds4_engine *engine = NULL;
+        assert(ds4_engine_open(&engine, &opt) == 0 && engine);
+        const int old_fd = g_model_fd;
+        const int vocab = ds4_engine_vocab_size(engine);
+        assert(vocab > 0);
+        if (prompt.len == 0) make_chunk_prompt(engine, long_context, &prompt);
+
+        ds4_session *session = NULL;
+        char err[256] = {0};
+        assert(ds4_session_create(&session, engine, ctx) == 0 && session);
+        assert(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+        assert(ds4_session_pos(session) == prompt.len);
+
+        float *actual = malloc((size_t)vocab * sizeof(*actual));
+        assert(actual);
+        copy_logits(session, actual, vocab);
+        float max_abs = 0.0f;
+        int max_index = -1;
+        if (chunks[ci] == 1) {
+            reference_vocab = vocab;
+            reference = malloc((size_t)vocab * sizeof(*reference));
+            assert(reference);
+            memcpy(reference, actual, (size_t)vocab * sizeof(*reference));
+        } else if (chunks[ci] > 1) {
+            assert(vocab == reference_vocab);
+            for (int i = 0; i < vocab; i++) {
+                const float diff = fabsf(actual[i] - reference[i]);
+                if (diff > max_abs) { max_abs = diff; max_index = i; }
+            }
+        }
+
+        int greedy[CHUNK_GREEDY_TOKENS];
+        float reference_top1_abs_diff[CHUNK_GREEDY_TOKENS] = {0};
+        unsigned divergences = 0;
+        for (unsigned i = 0; i < CHUNK_GREEDY_TOKENS; i++) {
+            copy_logits(session, actual, vocab);
+            greedy[i] = ds4_session_argmax(session);
+            assert(greedy[i] >= 0);
+            if (chunks[ci] == 0) {
+                unset_tokens[i] = greedy[i];
+            } else if (chunks[ci] == 1) {
+                int top1;
+                reference_tokens[i] = greedy[i];
+                top_two_logits(actual, vocab, &top1, &reference_top2[i],
+                               &reference_top1_logits[i], &reference_top2_logits[i]);
+                assert(top1 == reference_tokens[i]);
+            } else {
+                reference_top1_abs_diff[i] =
+                    fabsf(actual[reference_tokens[i]] - reference_top1_logits[i]);
+                if (greedy[i] != reference_tokens[i]) {
+                    const float gap = reference_top1_logits[i] - reference_top2_logits[i];
+                    assert(gap <= chunk_reference_gap_tolerance);
+                    assert(greedy[i] == reference_tokens[i] ||
+                           greedy[i] == reference_top2[i]);
+                    divergences++;
+                    printf("laguna-stream-chunk-divergence: N=%u step=%u "
+                           "case=near-tie-top2 ref_top1=%d ref_top2=%d chosen=%d "
+                           "ref_gap=%.8g ref_top1_abs_diff=%.8g\n",
+                           chunks[ci], i, reference_tokens[i], reference_top2[i],
+                           greedy[i], gap, reference_top1_abs_diff[i]);
+                }
+            }
+            assert(ds4_session_eval(session, greedy[i], err, sizeof(err)) == 0);
+        }
+        float *final_logits = malloc((size_t)vocab * sizeof(*final_logits));
+        assert(final_logits);
+        copy_logits(session, final_logits, vocab);
+        if (chunks[ci] == 0) {
+            unset_final = final_logits;
+            final_logits = NULL;
+        } else if (chunks[ci] == 1) {
+            assert(unset_final);
+            assert(memcmp(unset_final, final_logits,
+                          (size_t)vocab * sizeof(*final_logits)) == 0);
+            assert(memcmp(unset_tokens, greedy, sizeof(greedy)) == 0);
+            puts("laguna-stream-chunk-default: unset vs N=1 "
+                 "bit-identical final logits and greedy tokens");
+        }
+        printf("laguna-stream-chunk: N=%s prompt=%d max_abs_diff=%.8g "
+               "at=%d gate=%s divergences=%u ref_top1_abs_diff="
+               "%.8g,%.8g,%.8g,%.8g greedy=%d,%d,%d,%d\n",
+               chunks[ci] ? chunk_text : "unset", prompt.len, max_abs, max_index,
+               divergences ? "near-tie-top2" : "identical-greedy", divergences,
+               reference_top1_abs_diff[0], reference_top1_abs_diff[1],
+               reference_top1_abs_diff[2], reference_top1_abs_diff[3],
+               greedy[0], greedy[1], greedy[2], greedy[3]);
+
+        free(final_logits);
+        free(actual);
+        ds4_session_free(session);
+        ds4_engine_close(engine);
+        check_closed(old_fd);
+    }
+    assert(unsetenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK") == 0);
+    free(unset_final);
+    free(reference);
+    ds4_tokens_free(&prompt);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2 || argc > 3 || (argc == 3 && strcmp(argv[2], "--long-context"))) {
         fprintf(stderr, "usage: %s MODEL.gguf [--long-context]\n", argv[0]);
@@ -118,6 +287,7 @@ int main(int argc, char **argv) {
     const int ctx = long_context ? 1024 : 256;
     assert(setenv("DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY", "1", 1) == 0);
     assert(unsetenv("DS4_METAL_DISABLE_STREAMING_EXPERT_TIMING_SUMMARY") == 0);
+    assert(unsetenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK") == 0);
     ds4_engine_options opt = {.model_path = argv[1], .backend = DS4_BACKEND_METAL,
         .ssd_streaming = true, .ssd_streaming_cache_bytes = 8ull << 30,
         .context_size = ctx};
@@ -215,6 +385,7 @@ int main(int argc, char **argv) {
                cycle == 1 ? "injected EIO then close" : "open, run, close");
     }
     free(reference);
+    check_chunked_prefill(argv[1], ctx, long_context);
     puts("laguna-stream-engine: OK (prefill, row, resume, close/open, reopen after EIO)");
     return 0;
 }

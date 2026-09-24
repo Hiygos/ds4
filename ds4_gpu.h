@@ -2407,6 +2407,38 @@ int ds4_gpu_glm_routed_moe_batch_tensor(
         uint32_t                mid_token_stride,
         bool                    force_resident);
 
+/* Dedicated Laguna batch: under streaming it never uses resident weight
+ * views. */
+int ds4_gpu_laguna_routed_moe_batch_tensor(
+    ds4_gpu_tensor *out,
+    ds4_gpu_tensor *mid,
+    const void *model_map,
+    uint64_t model_size,
+    uint64_t gate_offset,
+    uint64_t up_offset,
+    uint64_t down_offset,
+    uint32_t gate_type,
+    uint32_t up_type,
+    uint32_t down_type,
+    uint64_t gate_expert_bytes,
+    uint64_t gate_row_bytes,
+    uint64_t up_expert_bytes,
+    uint64_t up_row_bytes,
+    uint64_t down_expert_bytes,
+    uint64_t down_row_bytes,
+    uint32_t expert_in_dim,
+    uint32_t expert_mid_dim,
+    uint32_t out_dim,
+    const ds4_gpu_tensor *selected,
+    const ds4_gpu_tensor *weights,
+    uint32_t n_total_expert,
+    uint32_t n_expert,
+    uint32_t layer_index,
+    const ds4_gpu_tensor *x,
+    uint32_t n_tokens,
+    uint32_t mid_token_stride,
+    bool force_resident);
+
 int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,

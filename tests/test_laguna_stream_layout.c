@@ -294,12 +294,70 @@ static void check_streaming_requests(void) {
     assert(accepted == -1 && session.checkpoint.len == 0);
 }
 
+static uint64_t laguna_graph_alloc_formula(uint32_t rows) {
+    const uint64_t f32 = sizeof(float);
+    const uint64_t embd = DS4_N_EMBD;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t routed = (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
+    const uint64_t ffn_max = DS4_N_FF_DENSE > routed ? DS4_N_FF_DENSE : routed;
+    uint64_t total = 0;
+
+    total += rows * sizeof(uint32_t);                 /* buffer tokens */
+    total += rows * embd * f32;                       /* buffer cur */
+    total += rows * embd * f32;                       /* buffer next */
+    total += rows * embd * f32;                       /* buffer attn_norm */
+    total += rows * q_dim * f32;                      /* buffer q */
+    total += rows * kv_dim * f32;                     /* buffer k */
+    total += rows * kv_dim * f32;                     /* buffer v */
+    total += rows * DS4_N_HEAD * f32;                 /* buffer gate */
+    total += rows * q_dim * f32;                      /* buffer heads */
+    total += rows * embd * f32;                       /* buffer attn_out */
+    total += rows * embd * f32;                       /* buffer after_attn */
+    total += rows * embd * f32;                       /* buffer ffn_norm */
+    total += rows * ffn_max * f32;                    /* buffer ffn_gate */
+    total += rows * ffn_max * f32;                    /* buffer ffn_up */
+    total += rows * ffn_max * f32;                    /* buffer ffn_mid */
+    total += rows * embd * f32;                       /* buffer ffn_out */
+    total += rows * embd * f32;                       /* buffer shared_out */
+    total += rows * routed * f32;                     /* buffer routed_mid */
+    total += rows * DS4_N_EXPERT * f32;               /* buffer router_logits */
+    total += rows * DS4_N_EXPERT * f32;               /* buffer router_probs */
+    total += rows * DS4_N_EXPERT_USED * sizeof(int32_t); /* buffer router_selected */
+    total += rows * DS4_N_EXPERT_USED * f32;          /* buffer router_weights */
+    total += sizeof(int32_t);                         /* buffer shared_selected */
+    total += sizeof(float);                           /* buffer shared_weight */
+    total += rows * kv_dim * sizeof(uint16_t);        /* buffer staged_key */
+    total += rows * kv_dim * sizeof(uint16_t);        /* buffer staged_value */
+    total += embd * f32;                              /* buffer output_norm */
+    total += DS4_N_VOCAB * f32;                       /* buffer logits */
+    return total;
+}
+
 static void check_memory_admission(void) {
     uint64_t kv, scratch;
     assert(laguna_stream_graph_bytes(256, &kv, &scratch));
     assert(kv == 48ull * 256 * 1024 * 2 * 2);
     assert(scratch > 0 && scratch < 1048576);
-    const uint64_t one_row_scratch = scratch;
+    const char *chunk_env = getenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK");
+    char *saved_chunk_env = chunk_env ? strdup(chunk_env) : NULL;
+    uint32_t chunk = 0;
+    const uint32_t chunks[] = {1, 2, 4, 8, 32};
+    for (unsigned i = 0; i < sizeof(chunks) / sizeof(chunks[0]); i++) {
+        char value[4];
+        snprintf(value, sizeof(value), "%u", chunks[i]);
+        assert(setenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK", value, 1) == 0);
+        assert(laguna_stream_prefill_chunk_from_env(&chunk) && chunk == chunks[i]);
+        assert(laguna_stream_graph_bytes(256, &kv, &scratch));
+        assert(scratch == laguna_graph_alloc_formula(chunks[i]));
+    }
+    assert(setenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK", "0", 1) == 0);
+    assert(!laguna_stream_prefill_chunk_from_env(&chunk));
+    assert(setenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK", "33", 1) == 0);
+    assert(!laguna_stream_prefill_chunk_from_env(&chunk));
+    assert(setenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK", "4x", 1) == 0);
+    assert(!laguna_stream_prefill_chunk_from_env(&chunk));
+    assert(setenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK", "1", 1) == 0);
     const uint32_t contexts[] = {1, 256, 512, 513, 1024};
     uint64_t previous = 0;
     for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
@@ -307,7 +365,7 @@ static void check_memory_admission(void) {
         assert(laguna_stream_graph_bytes(ctx, &kv, &scratch));
         /* Twelve full layers and thirty-six SWA layers, fp16 KV. */
         assert(kv == (12ull * ctx + 36ull * swa) * 1024 * 2 * 2);
-        assert(kv > previous && scratch == one_row_scratch);
+        assert(kv > previous && scratch == laguna_graph_alloc_formula(1));
         previous = kv;
         const uint64_t rec = 48ull << 30, non_routed = 5ull << 30;
         assert(laguna_stream_available_cache_bytes(rec, non_routed, ctx) ==
@@ -332,6 +390,12 @@ static void check_memory_admission(void) {
     assert(!laguna_stream_configure_cache(entry, 0, cap + 1, cap, &cache));
     assert(laguna_stream_configure_cache(entry, 0, 0, 20 * entry, &cache));
     assert(cache.experts == 20);
+    if (saved_chunk_env) {
+        assert(setenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK", saved_chunk_env, 1) == 0);
+        free(saved_chunk_env);
+    } else {
+        assert(unsetenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK") == 0);
+    }
 }
 
 static void check_engine_rejections(void) {
