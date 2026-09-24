@@ -49943,6 +49943,77 @@ static bool laguna_graph_forward_decode_token(
                                       capture, logits_out);
 }
 
+/* Shared expert of a Laguna MoE layer over n_rows rows. It does not depend on
+ * the routed experts and writes only ffn_gate/ffn_up/ffn_mid and shared_out, so
+ * under streaming it can run on the GPU while the CPU reads the missing
+ * experts. */
+static bool laguna_graph_shared_expert_rows(
+        ds4_laguna_gpu_graph    *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *l,
+        uint32_t                 n_tokens,
+        bool                     exact_q8_rows,
+        const char             **failed_stage) {
+    const bool exact_q8_shared =
+        exact_q8_rows &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_up_shexp->type == DS4_TENSOR_Q8_0;
+    bool ok;
+    if (exact_q8_shared) {
+        *failed_stage = "shared expert fused gate/up";
+        ok = ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+                 g->ffn_gate,
+                 g->ffn_up,
+                 g->ffn_mid,
+                 model->map,
+                 model->size,
+                 l->ffn_gate_shexp->abs_offset,
+                 l->ffn_up_shexp->abs_offset,
+                 DS4_N_EMBD,
+                 DS4_N_FF_SHARED,
+                 g->ffn_norm,
+                 n_tokens,
+                 0.0f) != 0;
+    } else {
+        *failed_stage = "shared expert gate/up";
+        ok = laguna_graph_matmul_decode_rows(
+                 g->ffn_gate,
+                 model,
+                 l->ffn_gate_shexp,
+                 g->ffn_norm,
+                 n_tokens,
+                 exact_q8_rows) &&
+             laguna_graph_matmul_decode_rows(
+                 g->ffn_up,
+                 model,
+                 l->ffn_up_shexp,
+                 g->ffn_norm,
+                 n_tokens,
+                 exact_q8_rows);
+        if (ok) {
+            *failed_stage = "shared expert SwiGLU";
+            ok = ds4_gpu_swiglu_tensor(
+                    g->ffn_mid,
+                    g->ffn_gate,
+                    g->ffn_up,
+                    (uint64_t)n_tokens * DS4_N_FF_SHARED,
+                    0.0f,
+                    1.0f) != 0;
+        }
+    }
+    if (ok) {
+        *failed_stage = "shared expert down";
+        ok = laguna_graph_matmul_decode_rows(
+                 g->shared_out,
+                 model,
+                 l->ffn_down_shexp,
+                 g->ffn_mid,
+                 n_tokens,
+                 exact_q8_rows);
+    }
+    return ok;
+}
+
 static bool laguna_graph_forward_batch(
         ds4_laguna_gpu_graph *g,
         const ds4_model      *model,
@@ -50343,6 +50414,24 @@ static bool laguna_graph_forward_batch(
                         n_tokens) != 0;
             }
 
+            /* Under streaming the batch consumer overlaps reading the missing
+             * experts with GPU work: the router is submitted alone and the
+             * shared expert, which does not depend on the routed experts, is
+             * encoded first, so the GPU runs it during the read. Same kernels
+             * and same buffers: only the order of two independent branches
+             * changes. */
+            bool shared_before_routed = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            if (ok && g->ssd_streaming) {
+                failed_stage = "router submit";
+                ok = ds4_gpu_laguna_stream_batch_submit_router(
+                        il, &shared_before_routed) != 0;
+            }
+#endif
+            if (ok && shared_before_routed) {
+                ok = laguna_graph_shared_expert_rows(
+                        g, model, l, n_tokens, exact_q8_rows, &failed_stage);
+            }
             const uint64_t gate_row_bytes =
                 routed_expert_row_bytes(l->ffn_gate_exps);
             const uint64_t up_row_bytes =
@@ -50402,61 +50491,9 @@ static bool laguna_graph_forward_batch(
                             true) != 0;
                 }
             }
-            const bool exact_q8_shared =
-                exact_q8_rows &&
-                l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
-                l->ffn_up_shexp->type == DS4_TENSOR_Q8_0;
-            if (ok && exact_q8_shared) {
-                failed_stage = "shared expert fused gate/up";
-                ok = ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
-                         g->ffn_gate,
-                         g->ffn_up,
-                         g->ffn_mid,
-                         model->map,
-                         model->size,
-                         l->ffn_gate_shexp->abs_offset,
-                         l->ffn_up_shexp->abs_offset,
-                         DS4_N_EMBD,
-                         DS4_N_FF_SHARED,
-                         g->ffn_norm,
-                         n_tokens,
-                         0.0f) != 0;
-            } else if (ok) {
-                failed_stage = "shared expert gate/up";
-                ok = laguna_graph_matmul_decode_rows(
-                         g->ffn_gate,
-                         model,
-                         l->ffn_gate_shexp,
-                         g->ffn_norm,
-                         n_tokens,
-                         exact_q8_rows) &&
-                     laguna_graph_matmul_decode_rows(
-                         g->ffn_up,
-                         model,
-                         l->ffn_up_shexp,
-                         g->ffn_norm,
-                         n_tokens,
-                         exact_q8_rows);
-                if (ok) {
-                    failed_stage = "shared expert SwiGLU";
-                    ok = ds4_gpu_swiglu_tensor(
-                            g->ffn_mid,
-                            g->ffn_gate,
-                            g->ffn_up,
-                            (uint64_t)n_tokens * DS4_N_FF_SHARED,
-                            0.0f,
-                            1.0f) != 0;
-                }
-            }
-            if (ok) {
-                failed_stage = "shared expert down";
-                ok = laguna_graph_matmul_decode_rows(
-                         g->shared_out,
-                         model,
-                         l->ffn_down_shexp,
-                         g->ffn_mid,
-                         n_tokens,
-                         exact_q8_rows);
+            if (ok && !shared_before_routed) {
+                ok = laguna_graph_shared_expert_rows(
+                        g, model, l, n_tokens, exact_q8_rows, &failed_stage);
             }
             if (ok) {
                 failed_stage = "MoE residual";

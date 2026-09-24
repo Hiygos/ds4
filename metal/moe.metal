@@ -1365,6 +1365,69 @@ kernel void kernel_glm_q4_K_addr_pair_swiglu_f32_masked(
         tgpig, slot, token, selected_off, 0, tiisg, sgitg);
 }
 
+// Same projection as kernel_glm_q4_K_addr_pair_swiglu_f32, restricted to the
+// (row, slot) pairs whose expert has its bit set in expert_mask: the other
+// pairs are not written. The Laguna streaming batch consumer launches it twice
+// on the same mid, first on the resident experts while the CPU reads the
+// missing ones, then on the missing ones. Every mid element is computed by
+// exactly one pass with the same helper, and the down projection stays a single
+// dispatch that sums the slots in the original order: the result is
+// bit-identical to the single pass.
+kernel void kernel_laguna_q4_K_addr_pair_swiglu_f32_expert_masked(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const uint64_t *gate_addrs,
+        device const uint64_t *up_addrs,
+        device const float *x,
+        device const int32_t *selected,
+        device const float *weights,
+        device float *mid,
+        constant uint32_t *expert_mask,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tgpig.y;
+    const uint token = tgpig.z;
+    if (slot >= args.n_expert_used || token >= args.n_tokens) return;
+
+    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
+    const int expert = selected[selected_off];
+    // Unlike the unmasked kernel, which writes 0 to mid, an out-of-range ID
+    // writes nothing here. This is safe only because the batch consumer's
+    // classify step rejects invalid IDs before any masked pass.
+    if (expert < 0 || (uint)expert >= args.n_total_expert) return;
+    if ((expert_mask[(uint)expert >> 5] & (1u << ((uint)expert & 31u))) == 0u) return;
+    const short NSG = 2;
+    const uint row0 = ((uint)tgpig.x * (uint)NSG + (uint)sgitg) * N_R0_Q4_K;
+    const uint64_t mid_base = (uint64_t)token * args.mid_token_stride +
+                              (uint64_t)slot * args.mid_dim;
+    if (row0 >= args.mid_dim) return;
+
+    const uint64_t gate_addr = gate_addrs[(uint)expert];
+    const uint64_t up_addr = up_addrs[(uint)expert];
+    if (gate_addr == 0 || up_addr == 0) {
+        if (tiisg == 0u) {
+            for (short row = 0;
+                 row < N_R0_Q4_K && row0 + (uint)row < args.mid_dim;
+                 row++) {
+                mid[mid_base + row0 + (uint)row] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    ds4_metal_glm_routed_moe_args local = args;
+    local.n_total_expert = 1;
+    local.gate_expert_bytes = 0;
+    local.up_expert_bytes = 0;
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K>(
+        local,
+        reinterpret_cast<device const char *>(gate_addr),
+        reinterpret_cast<device const char *>(up_addr),
+        x, weights, mid, scratch,
+        tgpig, slot, token, selected_off, 0, tiisg, sgitg);
+}
+
 kernel void kernel_glm_q4_K_slots6_pair_swiglu_f32(
         constant ds4_metal_glm_routed_moe_args &args,
         device const char *gate0,

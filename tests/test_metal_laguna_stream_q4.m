@@ -481,6 +481,240 @@ static int check_batch_victims(laguna_stream_fixture *f, uint64_t bytes) {
     return 1;
 }
 
+/* Fill the cache (1618 entries) always in the same order: layers 1..6 whole
+ * plus experts 0..81 of layer 20. The state is identical at every call, so the
+ * victims are identical for the two paths being compared. */
+static void fill_cache_for_overlap(laguna_stream_fixture *f, ds4_gpu_tensor *out1,
+                                   ds4_gpu_tensor *mid1, ds4_gpu_tensor *sel1,
+                                   ds4_gpu_tensor *w1, ds4_gpu_tensor *x1) {
+    ds4_gpu_stream_expert_cache_clear_all(0);
+    ds4_gpu_stream_expert_cache_reset_route_hotness();
+    int32_t ids[10];
+    for (unsigned layer = 1; layer <= 7; layer++) {
+        const unsigned count = layer == 7 ? 82 : 256, il = layer == 7 ? 20 : layer;
+        for (unsigned done = 0; done < count; done += 10) {
+            const unsigned first = count - done < 10 ? count - 10 : done;
+            for (unsigned i = 0; i < 10; i++) ids[i] = (int32_t)(first + i);
+            assert(ds4_gpu_tensor_write(sel1, 0, ids, sizeof(ids)));
+            assert(ds4_gpu_laguna_stream_routed_moe_one_tensor(
+                out1, mid1, f->map, f->size, &f->desc, FIX_DIM, FIX_DIM, FIX_DIM,
+                sel1, w1, FIX_TOTAL, 10, il, x1));
+        }
+    }
+    assert(ds4_gpu_stream_expert_cache_current_count() == 1618);
+}
+
+/* Every row of out and mid against the fixture's host oracle. */
+static void assert_batch_reference(laguna_stream_fixture *f, unsigned rows,
+                                   const int32_t *ids, const float *ws,
+                                   const float *input, const float *out,
+                                   const float *mid) {
+    for (unsigned r = 0; r < rows; r++) {
+        double expected[FIX_DIM], expected_mid[10 * FIX_DIM];
+        fixture_reference(f, ids + r * 10, ws + r * 10, input + r * FIX_DIM,
+                          expected, expected_mid);
+        for (unsigned i = 0; i < 10 * FIX_DIM; i++) {
+            const float a = mid[r * 10 * FIX_DIM + i];
+            assert(isfinite(a) &&
+                   fabs(a - expected_mid[i]) < 1e-7 + 1e-4 * fabs(expected_mid[i]));
+        }
+        for (unsigned i = 0; i < FIX_DIM; i++) {
+            const float a = out[r * FIX_DIM + i];
+            assert(isfinite(a) && fabs(a - expected[i]) < 1e-4 * (1 + fabs(expected[i])));
+        }
+    }
+}
+
+/* Consistent cache: per-layer and total counts equal the valid entries, and no
+ * entry is still marked in flight. */
+static void assert_cache_consistent(void) {
+    uint32_t total = 0;
+    for (unsigned il = 0; il < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; il++) {
+        uint32_t valid = 0;
+        for (unsigned e = 0; e < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; e++) {
+            ds4_gpu_stream_expert_cache_entry *entry = &g_stream_expert_cache[il][e];
+            if (!entry->valid) continue;
+            assert(!ds4_gpu_stream_expert_cache_entry_inflight(entry));
+            valid++;
+        }
+        assert(g_stream_expert_cache_layer_count[il] == valid);
+        total += valid;
+    }
+    assert(g_stream_expert_cache_entry_count == total);
+}
+
+/* Batch consumer with overlap: at a full cache, mixed, all-missing and
+ * all-resident unions, with experts shared across rows and across the two
+ * masks, and with duplicate slots, must give out and mid bit-identical to the
+ * serial path (DS4_LAGUNA_STREAM_BATCH_OVERLAP=0), with the same cache
+ * afterwards. The blit after the router submit stands in for the shared expert:
+ * independent work that must start before the read and stay correct. Then a
+ * read error in the middle of the overlap must leave the cache consistent. */
+static int check_batch_overlap(laguna_stream_fixture *f, ds4_gpu_tensor *out1,
+                               ds4_gpu_tensor *mid1, ds4_gpu_tensor *sel1,
+                               ds4_gpu_tensor *w1, ds4_gpu_tensor *x1) {
+    enum { ROWS = 4, LAYER = 20, CASES = 5 };
+    /* Layer 20 has experts 0..81 cached. */
+    static const unsigned first_ids[CASES][ROWS] = {
+        {0, 30, 60, 90},      /* mixed: 90..99 missing */
+        {100, 130, 160, 190}, /* all missing */
+        {0, 20, 40, 60},      /* all resident */
+        {0, 5, 30, 76},       /* 5..9 in two rows; 76..85 straddle: 82..85 missing */
+        {78, 80, 0, 10},      /* slots 8 and 9 repeat 0 and 1: 82..87 missing */
+    };
+    static const unsigned expected_missing[CASES] = {10, 40, 0, 4, 6};
+    static const bool expected_mixed[CASES] = {true, false, false, true, true};
+    static const bool duplicate_slots[CASES] = {false, false, false, false, true};
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(ROWS * FIX_DIM * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(ROWS * 10 * FIX_DIM * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(ROWS * FIX_DIM * sizeof(float));
+    ds4_gpu_tensor *copy = ds4_gpu_tensor_alloc(ROWS * FIX_DIM * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(ROWS * 10 * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(ROWS * 10 * sizeof(float));
+    assert(out && mid && x && copy && selected && weights);
+    static float input[ROWS * FIX_DIM], copied[ROWS * FIX_DIM];
+    static float result[2][ROWS * FIX_DIM], result_mid[2][ROWS * 10 * FIX_DIM];
+    float ws[ROWS * 10];
+    int32_t ids[ROWS * 10];
+    for (unsigned i = 0; i < ROWS * FIX_DIM; i++)
+        input[i] = (1.0f + (float)((i * 7u + i / FIX_DIM) % 13u)) / (9.0f * FIX_DIM);
+    for (unsigned i = 0; i < ROWS * 10; i++) ws[i] = 0.05f + 0.01f * (float)(i % 7u);
+    assert(ds4_gpu_tensor_write(x, 0, input, sizeof(input)));
+    assert(ds4_gpu_tensor_write(weights, 0, ws, sizeof(ws)));
+
+    for (unsigned c = 0; c < CASES; c++) {
+        for (unsigned r = 0; r < ROWS; r++)
+            for (unsigned i = 0; i < 10; i++)
+                ids[r * 10 + i] = duplicate_slots[c] && i >= 8 ?
+                    ids[r * 10 + i - 8] : (int32_t)(first_ids[c][r] + i);
+        uint64_t delta[2][4];
+        for (unsigned mode = 0; mode < 2; mode++) {
+            assert(setenv("DS4_LAGUNA_STREAM_BATCH_OVERLAP", mode ? "1" : "0", 1) == 0);
+            fill_cache_for_overlap(f, out1, mid1, sel1, w1, x1);
+            assert(ds4_gpu_tensor_write(selected, 0, ids, sizeof(ids)));
+            for (unsigned i = 0; i < ROWS * 10 * FIX_DIM; i++) result_mid[mode][i] = NAN;
+            assert(ds4_gpu_tensor_write(mid, 0, result_mid[mode], sizeof(result_mid[mode])));
+            const uint64_t hits = g_stream_expert_cache_hits;
+            const uint64_t misses = g_stream_expert_cache_misses;
+            const uint64_t evictions = g_stream_expert_cache_evictions;
+            const uint64_t reads = g_stream_expert_cache_pread_bytes;
+            const uint64_t layers = g_laguna_stream_batch_layers;
+            const uint64_t overlapped = g_laguna_stream_batch_overlap_layers;
+            const uint64_t mixed = g_laguna_stream_batch_mixed;
+            const uint64_t missing = g_laguna_stream_batch_missing_experts;
+
+            assert(ds4_gpu_begin_commands());
+            bool overlap = !mode;
+            assert(ds4_gpu_laguna_stream_batch_submit_router(LAYER, &overlap));
+            assert(overlap == (mode == 1));
+            assert(ds4_gpu_tensor_copy(copy, 0, x, 0, sizeof(input)));
+            assert(ds4_gpu_laguna_routed_moe_batch_tensor(
+                out, mid, f->map, f->size,
+                f->desc.gate_offset, f->desc.up_offset, f->desc.down_offset,
+                f->desc.gate_type, f->desc.up_type, f->desc.down_type,
+                f->desc.gate_expert_bytes, f->desc.gate_row_bytes,
+                f->desc.up_expert_bytes, f->desc.up_row_bytes,
+                f->desc.down_expert_bytes, f->desc.down_row_bytes,
+                FIX_DIM, FIX_DIM, FIX_DIM, selected, weights, FIX_TOTAL, 10, LAYER,
+                x, ROWS, 10 * FIX_DIM, false));
+            assert(g_laguna_stream_batch_router_layer == 0);
+            assert(ds4_gpu_end_commands());
+
+            assert(ds4_gpu_tensor_read(out, 0, result[mode], sizeof(result[mode])));
+            assert(ds4_gpu_tensor_read(mid, 0, result_mid[mode], sizeof(result_mid[mode])));
+            assert(ds4_gpu_tensor_read(copy, 0, copied, sizeof(copied)));
+            assert(memcmp(copied, input, sizeof(input)) == 0);
+            delta[mode][0] = g_stream_expert_cache_hits - hits;
+            delta[mode][1] = g_stream_expert_cache_misses - misses;
+            delta[mode][2] = g_stream_expert_cache_evictions - evictions;
+            delta[mode][3] = g_stream_expert_cache_pread_bytes - reads;
+            assert(delta[mode][1] == expected_missing[c]);
+            assert(g_laguna_stream_batch_layers - layers == 1);
+            assert(g_laguna_stream_batch_missing_experts - missing == expected_missing[c]);
+            assert(g_laguna_stream_batch_mixed - mixed == expected_mixed[c]);
+            assert(g_laguna_stream_batch_overlap_layers - overlapped ==
+                   (mode == 1 && expected_mixed[c]));
+            assert_cache_consistent();
+            for (unsigned r = 0; r < ROWS; r++) {
+                ds4_gpu_stream_expert_cache_entry *e =
+                    &g_stream_expert_cache[LAYER][first_ids[c][r]];
+                assert(e->valid && !ds4_gpu_stream_expert_cache_entry_inflight(e));
+            }
+        }
+        /* The criterion is bit identity, not a tolerance. */
+        assert(memcmp(result[0], result[1], sizeof(result[0])) == 0);
+        assert(memcmp(result_mid[0], result_mid[1], sizeof(result_mid[0])) == 0);
+        assert(memcmp(delta[0], delta[1], sizeof(delta[0])) == 0);
+        /* And the common result is the right one, row by row. */
+        assert_batch_reference(f, ROWS, ids, ws, input, result[1], result_mid[1]);
+    }
+
+    /* I/O error in the middle of the overlap, on the mixed case: the resident
+     * pass is in flight when the read of the missing experts fails. The layer
+     * must be empty again with a consistent count and no entry in flight, and
+     * the same call must then succeed with the right result. */
+    assert(setenv("DS4_LAGUNA_STREAM_BATCH_OVERLAP", "1", 1) == 0);
+    fill_cache_for_overlap(f, out1, mid1, sel1, w1, x1);
+    for (unsigned r = 0; r < ROWS; r++)
+        for (unsigned i = 0; i < 10; i++) ids[r * 10 + i] = (int32_t)(first_ids[0][r] + i);
+    assert(ds4_gpu_tensor_write(selected, 0, ids, sizeof(ids)));
+    const uint64_t failures = g_laguna_stream_failures;
+    const uint64_t overlapped = g_laguna_stream_batch_overlap_layers;
+    const uint64_t layers = g_laguna_stream_batch_layers;
+    /* The batch consumer tasks do not go through the fault_pread hook (they are
+     * not tagged laguna): the error is produced by pointing the model
+     * descriptor at a directory, where pread fails with EISDIR. */
+    const int model_fd = g_model_fd;
+    const int dir_fd = open(".", O_RDONLY);
+    assert(dir_fd >= 0);
+    g_model_fd = dir_fd;
+    assert(ds4_gpu_begin_commands());
+    bool overlap = false;
+    assert(ds4_gpu_laguna_stream_batch_submit_router(LAYER, &overlap) && overlap);
+    assert(!ds4_gpu_laguna_routed_moe_batch_tensor(
+        out, mid, f->map, f->size,
+        f->desc.gate_offset, f->desc.up_offset, f->desc.down_offset,
+        f->desc.gate_type, f->desc.up_type, f->desc.down_type,
+        f->desc.gate_expert_bytes, f->desc.gate_row_bytes,
+        f->desc.up_expert_bytes, f->desc.up_row_bytes,
+        f->desc.down_expert_bytes, f->desc.down_row_bytes,
+        FIX_DIM, FIX_DIM, FIX_DIM, selected, weights, FIX_TOTAL, 10, LAYER,
+        x, ROWS, 10 * FIX_DIM, false));
+    g_model_fd = model_fd;
+    assert(close(dir_fd) == 0);
+    if (ds4_gpu_commands_active()) assert(ds4_gpu_end_commands());
+    assert(g_laguna_stream_failures - failures == 1);
+    assert(g_laguna_stream_batch_layers - layers == 1);
+    assert(g_laguna_stream_batch_overlap_layers - overlapped == 1);
+    assert(!g_stream_expert_pending_load.active);
+    assert(g_stream_expert_cache_layer_count[LAYER] == 0);
+    for (unsigned e = 0; e < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; e++)
+        assert(!g_stream_expert_cache[LAYER][e].valid);
+    assert_cache_consistent();
+    assert(ds4_gpu_begin_commands());
+    assert(ds4_gpu_laguna_routed_moe_batch_tensor(
+        out, mid, f->map, f->size,
+        f->desc.gate_offset, f->desc.up_offset, f->desc.down_offset,
+        f->desc.gate_type, f->desc.up_type, f->desc.down_type,
+        f->desc.gate_expert_bytes, f->desc.gate_row_bytes,
+        f->desc.up_expert_bytes, f->desc.up_row_bytes,
+        f->desc.down_expert_bytes, f->desc.down_row_bytes,
+        FIX_DIM, FIX_DIM, FIX_DIM, selected, weights, FIX_TOTAL, 10, LAYER,
+        x, ROWS, 10 * FIX_DIM, false));
+    assert(ds4_gpu_end_commands());
+    assert(g_stream_expert_cache_layer_count[LAYER] == 40);
+    assert_cache_consistent();
+    assert(ds4_gpu_tensor_read(out, 0, result[1], sizeof(result[1])));
+    assert(ds4_gpu_tensor_read(mid, 0, result_mid[1], sizeof(result_mid[1])));
+    assert_batch_reference(f, ROWS, ids, ws, input, result[1], result_mid[1]);
+    assert(unsetenv("DS4_LAGUNA_STREAM_BATCH_OVERLAP") == 0);
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(copy); ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(weights);
+    puts("laguna-stream-batch-overlap: OK (mixed/all-missing/all-resident, shared and "
+         "duplicate experts, bit-identical to serial, I/O failure cleanup)");
+    return 1;
+}
+
 static int check_saturation(bool slabs) {
     @autoreleasepool {
         /* Same slot count as the real 8 GiB cache; payload 48 times smaller. */
@@ -577,6 +811,7 @@ static int check_saturation(bool slabs) {
         assert(!g_stream_expert_cache_decode_tokens && !g_laguna_stream_failures);
         assert(g_test_model_range_calls == views);
         assert(check_batch_victims(&f, bytes));
+        assert(check_batch_overlap(&f, out, mid, selected, weights, x));
         ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(weights);
         ds4_gpu_cleanup(); assert_cache_drained(); fixture_close(&f);

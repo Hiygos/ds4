@@ -2409,6 +2409,15 @@ int ds4_gpu_glm_routed_moe_batch_tensor(
         uint32_t                mid_token_stride,
         bool                    force_resident);
 
+/* Submit the layer router, already encoded in the open batch, so that the
+ * Laguna streaming batch consumer can wait for it alone. With *overlap true
+ * the caller then encodes the work that does not depend on the routed
+ * experts (the shared expert): it runs on the GPU while the CPU reads the
+ * missing experts. Without streaming, without an open batch, or with
+ * DS4_LAGUNA_STREAM_BATCH_OVERLAP=0 it does nothing and leaves *overlap
+ * false. */
+int ds4_gpu_laguna_stream_batch_submit_router(uint32_t layer_index, bool *overlap);
+
 /* Dedicated Laguna batch: under streaming it never uses resident weight
  * views. */
 int ds4_gpu_laguna_routed_moe_batch_tensor(

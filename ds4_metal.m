@@ -221,6 +221,7 @@ static id<MTLComputePipelineState> g_glm_q2_k_addr_pair_swiglu2_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline;
+static id<MTLComputePipelineState> g_laguna_q4_k_addr_pair_swiglu_expert_masked_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q3_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_down_f32_pipeline;
@@ -347,6 +348,19 @@ static uint64_t g_laguna_stream_prefill_distinct_selected;
 static uint64_t g_laguna_stream_prefill_distinct_loaded;
 static uint32_t g_laguna_stream_prefill_distinct_max;
 static double g_laguna_stream_wait_before_ms, g_laguna_stream_wait_after_ms;
+/* Batch consumer (block prefill): per-layer classification of the union and
+ * timings of the overlap between the miss reads and the GPU. sync is the router
+ * wait before reading the IDs, io the preparation plus read and install of the
+ * misses, tail the remaining GPU wait after the read: with the overlap on it is
+ * close to zero. */
+static uint64_t g_laguna_stream_batch_layers, g_laguna_stream_batch_overlap_layers;
+static uint64_t g_laguna_stream_batch_all_resident, g_laguna_stream_batch_all_missing;
+static uint64_t g_laguna_stream_batch_mixed;
+static uint64_t g_laguna_stream_batch_resident_experts, g_laguna_stream_batch_missing_experts;
+static double g_laguna_stream_batch_sync_ms, g_laguna_stream_batch_io_ms;
+static double g_laguna_stream_batch_submit_ms, g_laguna_stream_batch_tail_wait_ms;
+/* Layer+1 of the router already submitted alone to the GPU; 0 if none. */
+static uint32_t g_laguna_stream_batch_router_layer;
 static uint32_t g_laguna_stream_record_row_index;
 static int g_laguna_selected_trace_record_initialized;
 static FILE *g_laguna_selected_trace_record_fp;
@@ -466,6 +480,14 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
 static void ds4_gpu_stream_expert_pending_load_clear(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
 static void ds4_gpu_laguna_stream_reset(void);
+
+/* A/B diagnostic: DS4_LAGUNA_STREAM_BATCH_OVERLAP=0 returns the Laguna batch
+ * consumer to the serial path (wait, read, MoE). Read at every layer like the
+ * other streaming variables, so tests can change it. */
+static int ds4_gpu_laguna_stream_batch_overlap_enabled(void) {
+    const char *v = getenv("DS4_LAGUNA_STREAM_BATCH_OVERLAP");
+    return !v || strcmp(v, "0") != 0;
+}
 static int ds4_gpu_stream_expert_timing_summary_enabled(void);
 static int ds4_gpu_stream_expert_cache_entry_protected(
         uint32_t       layer,
@@ -8018,6 +8040,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_q4_K_addr_pair_swiglu_f32");
         g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q4_K_addr_pair_swiglu_f32_masked");
+        g_laguna_q4_k_addr_pair_swiglu_expert_masked_pipeline =
+            ds4_gpu_get_pipeline("kernel_laguna_q4_K_addr_pair_swiglu_f32_expert_masked");
         g_glm_q2_k_down_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q2_K_down_f32");
         g_glm_q3_k_down_f32_pipeline =
@@ -8126,6 +8150,7 @@ int ds4_gpu_init(void) {
             !g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline ||
             !g_glm_q4_k_addr_pair_swiglu_f32_pipeline ||
             !g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline ||
+            !g_laguna_q4_k_addr_pair_swiglu_expert_masked_pipeline ||
             !g_glm_q2_k_down_f32_pipeline ||
             !g_glm_q3_k_down_f32_pipeline ||
             !g_glm_q4_k_down_f32_pipeline ||
@@ -8439,6 +8464,7 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
 int ds4_gpu_begin_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) return 0;
+    g_laguna_stream_batch_router_layer = 0;
     g_batch_cb = ds4_gpu_new_command_buffer();
     g_batch_has_work = NO;
     if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
@@ -9260,6 +9286,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
 
 int ds4_gpu_end_commands(void) {
     if (!g_batch_cb) return 0;
+    g_laguna_stream_batch_router_layer = 0;
     ds4_gpu_close_batch_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
@@ -9378,6 +9405,27 @@ void ds4_gpu_cleanup(void) {
                     (double)g_laguna_stream_prefill_distinct_loaded /
                         (double)g_laguna_stream_prefill_layer_unions,
                     g_laguna_stream_prefill_distinct_max);
+        }
+        if (g_laguna_stream_batch_layers &&
+            ds4_gpu_stream_expert_timing_summary_enabled()) {
+            const double layers = (double)g_laguna_stream_batch_layers;
+            fprintf(stderr, "ds4: Laguna streaming batch overlap=%s layers=%llu "
+                    "overlapped=%llu all_resident=%llu all_missing=%llu "
+                    "cache_mixed=%llu resident_avg=%.2f missing_avg=%.2f "
+                    "sync_ms=%.3f io_ms=%.3f resident_submit_ms=%.3f "
+                    "gpu_tail_wait_ms=%.3f\n",
+                    ds4_gpu_laguna_stream_batch_overlap_enabled() ? "on" : "off",
+                    (unsigned long long)g_laguna_stream_batch_layers,
+                    (unsigned long long)g_laguna_stream_batch_overlap_layers,
+                    (unsigned long long)g_laguna_stream_batch_all_resident,
+                    (unsigned long long)g_laguna_stream_batch_all_missing,
+                    (unsigned long long)g_laguna_stream_batch_mixed,
+                    (double)g_laguna_stream_batch_resident_experts / layers,
+                    (double)g_laguna_stream_batch_missing_experts / layers,
+                    g_laguna_stream_batch_sync_ms,
+                    g_laguna_stream_batch_io_ms,
+                    g_laguna_stream_batch_submit_ms,
+                    g_laguna_stream_batch_tail_wait_ms);
         }
         ds4_gpu_laguna_selected_trace_record_close();
         ds4_gpu_stream_expert_pread_pool_shutdown();
@@ -9557,6 +9605,7 @@ void ds4_gpu_cleanup(void) {
         g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline = nil;
         g_glm_q4_k_addr_pair_swiglu_f32_pipeline = nil;
         g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline = nil;
+        g_laguna_q4_k_addr_pair_swiglu_expert_masked_pipeline = nil;
         g_glm_q2_k_down_f32_pipeline = nil;
         g_glm_q3_k_down_f32_pipeline = nil;
         g_glm_q4_k_down_f32_pipeline = nil;
@@ -11160,6 +11209,13 @@ static void ds4_gpu_laguna_stream_reset(void) {
     g_laguna_stream_prefill_distinct_loaded = 0;
     g_laguna_stream_prefill_distinct_max = 0;
     g_laguna_stream_wait_before_ms = g_laguna_stream_wait_after_ms = 0;
+    g_laguna_stream_batch_layers = g_laguna_stream_batch_overlap_layers = 0;
+    g_laguna_stream_batch_all_resident = g_laguna_stream_batch_all_missing = 0;
+    g_laguna_stream_batch_mixed = 0;
+    g_laguna_stream_batch_resident_experts = g_laguna_stream_batch_missing_experts = 0;
+    g_laguna_stream_batch_sync_ms = g_laguna_stream_batch_io_ms = 0;
+    g_laguna_stream_batch_submit_ms = g_laguna_stream_batch_tail_wait_ms = 0;
+    g_laguna_stream_batch_router_layer = 0;
     g_laguna_stream_cache_used = 0;
 }
 
@@ -36751,6 +36807,138 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_addr_tensor(
     return 1;
 }
 
+enum {
+    DS4_LAGUNA_STREAM_EXPERT_MASK_WORDS =
+        (DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT + 31) / 32,
+};
+
+/*
+ * Classify the union of the Laguna batch into experts already cached and
+ * missing ones, with the same tests as ds4_gpu_stream_expert_cache_peek but
+ * without touching hits, clock or hotness: the preparation that follows stays
+ * identical with or without the overlap, and so do the cache, the victims and
+ * the counters. Resident entries are part of the union, which the preparation
+ * protects from eviction: their slots in the address table do not change while
+ * the GPU reads them. Returns 0 if an ID is out of range; the preparation will
+ * reject it.
+ */
+static int ds4_gpu_laguna_stream_batch_classify(
+        const void           *model_map,
+        uint64_t              model_size,
+        uint32_t              layer,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_ids,
+        uint32_t              n_total_expert,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint64_t              gate_expert_bytes,
+        uint64_t              down_expert_bytes,
+        uint32_t              resident_mask[DS4_LAGUNA_STREAM_EXPERT_MASK_WORDS],
+        uint32_t              missing_mask[DS4_LAGUNA_STREAM_EXPERT_MASK_WORDS],
+        ds4_gpu_stream_expert_cache_entry **resident_entries,
+        uint32_t             *n_resident,
+        uint32_t             *n_missing) {
+    int32_t ids[DS4_LAGUNA_STREAM_PREFILL_CHUNK_MAX * DS4_STREAM_Q4_MAX_SELECTED];
+    memset(resident_mask, 0, DS4_LAGUNA_STREAM_EXPERT_MASK_WORDS * sizeof(uint32_t));
+    memset(missing_mask, 0, DS4_LAGUNA_STREAM_EXPERT_MASK_WORDS * sizeof(uint32_t));
+    *n_resident = 0;
+    *n_missing = 0;
+    if (n_ids > sizeof(ids) / sizeof(ids[0]) ||
+        n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
+        !ds4_gpu_tensor_read(selected, 0, ids, (uint64_t)n_ids * sizeof(ids[0]))) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < n_ids; i++) {
+        if (ids[i] < 0 || (uint32_t)ids[i] >= n_total_expert) return 0;
+        const uint32_t expert = (uint32_t)ids[i];
+        const uint32_t word = expert >> 5, bit = 1u << (expert & 31u);
+        if ((resident_mask[word] | missing_mask[word]) & bit) continue;
+        const uint64_t gate_rel = (uint64_t)expert * gate_expert_bytes;
+        ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
+        if (ds4_gpu_stream_expert_cache_entry_matches(
+                    e, model_map, model_size,
+                    gate_offset + gate_rel, up_offset + gate_rel,
+                    down_offset + (uint64_t)expert * down_expert_bytes,
+                    gate_expert_bytes, down_expert_bytes)) {
+            resident_mask[word] |= bit;
+            resident_entries[(*n_resident)++] = e;
+        } else {
+            missing_mask[word] |= bit;
+            (*n_missing)++;
+        }
+    }
+    return 1;
+}
+
+int ds4_gpu_laguna_stream_batch_submit_router(uint32_t layer_index, bool *overlap) {
+    if (overlap) *overlap = false;
+    if (!g_initialized || !g_ssd_streaming_mode || !g_batch_cb ||
+        layer_index >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        !ds4_gpu_laguna_stream_batch_overlap_enabled()) {
+        return 1;
+    }
+    if (!ds4_gpu_flush_commands()) return 0;
+    g_laguna_stream_batch_router_layer = layer_index + 1u;
+    if (overlap) *overlap = true;
+    return 1;
+}
+
+/*
+ * One half of the gate/up pair of the Laguna batch consumer: same arguments and
+ * grid as the single pass, but only the (row, slot) pairs whose expert is set
+ * in expert_mask. Every entry reads its own address tables, so its buffers must
+ * be declared resident to the encoder.
+ */
+static int ds4_gpu_laguna_stream_encode_masked_pair(
+        id<MTLCommandBuffer>                cb,
+        id<MTLComputePipelineState>         pipeline,
+        const ds4_gpu_glm_routed_moe_args  *args,
+        NSUInteger                          x_groups,
+        NSUInteger                          threads,
+        uint32_t                            n_expert,
+        uint32_t                            n_tokens,
+        id<MTLBuffer>                       gate_table,
+        id<MTLBuffer>                       up_table,
+        const ds4_gpu_tensor               *x,
+        const ds4_gpu_tensor               *selected,
+        const ds4_gpu_tensor               *weights,
+        ds4_gpu_tensor                     *mid,
+        const uint32_t                      expert_mask[DS4_LAGUNA_STREAM_EXPERT_MASK_WORDS],
+        ds4_gpu_stream_expert_cache_entry * const *entries,
+        uint32_t                            n_entries) {
+    id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+    id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
+    id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
+    id<MTLBuffer> midbuf = ds4_gpu_tensor_buffer(mid);
+    if (!cb || !pipeline || !gate_table || !up_table ||
+        !xbuf || !selectedbuf || !weightsbuf || !midbuf) {
+        return 0;
+    }
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    [enc setBuffer:gate_table offset:0 atIndex:1];
+    [enc setBuffer:up_table offset:0 atIndex:2];
+    [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
+    [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:4];
+    [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:5];
+    [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:6];
+    [enc setBytes:expert_mask
+           length:DS4_LAGUNA_STREAM_EXPERT_MASK_WORDS * sizeof(uint32_t)
+          atIndex:7];
+    for (uint32_t i = 0; i < n_entries; i++) {
+        [enc useResource:entries[i]->gate_buffer usage:MTLResourceUsageRead];
+        [enc useResource:entries[i]->up_buffer usage:MTLResourceUsageRead];
+    }
+    [enc dispatchThreadgroups:MTLSizeMake(x_groups, (NSUInteger)n_expert,
+                                          (NSUInteger)n_tokens)
+         threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
@@ -37042,10 +37230,138 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                                  "kernel_glm_q6_K_down_f32");
         if (!pair_pipeline || !down_pipeline) return 0;
 
+        /* Arguments and grid of the gate/up pair: shared by the two halves of
+         * the Laguna batch consumer, identical to the single pass. */
+        ds4_gpu_glm_routed_moe_args args = {
+            .tp_rank = g_tp_split_rank,
+            .tp_world = g_tp_split_world,
+            .tp_expert_base = (int32_t)first_expert,
+            .in_dim = expert_in_dim,
+            .mid_dim = expert_mid_dim,
+            .out_dim = out_dim,
+            .n_total_expert = n_total_expert,
+            .n_expert_used = n_expert,
+            .n_tokens = n_tokens,
+            .mid_token_stride = mid_token_stride,
+            .down_type = down_type,
+            .gate_expert_bytes = gate_expert_bytes,
+            .gate_row_bytes = gate_row_bytes,
+            .up_expert_bytes = up_expert_bytes,
+            .up_row_bytes = up_row_bytes,
+            .down_expert_bytes = down_expert_bytes,
+            .down_row_bytes = down_row_bytes,
+        };
+        const NSUInteger pair_x_groups =
+            gate_pair_q2 ? (use_stream_expert_addr_table ?
+                            (NSUInteger)((expert_mid_dim + 1u) / 2u) :
+                            (NSUInteger)((expert_mid_dim + 7u) / 8u)) :
+            gate_pair_q3 ? (NSUInteger)((expert_mid_dim + 3u) / 4u) :
+            gate_pair_q5 ? (NSUInteger)((expert_mid_dim + 7u) / 8u) :
+            use_stream_expert_addr_table ? (NSUInteger)((expert_mid_dim + 3u) / 4u) :
+            q4_scalar_pair ? (NSUInteger)expert_mid_dim :
+            q4_pair2 ? (NSUInteger)((expert_mid_dim + 1u) / 2u) :
+            (NSUInteger)((expert_mid_dim + 7u) / 8u);
+        const NSUInteger pair_threadgroup_bytes =
+            q4_scalar_pair ? 512u * sizeof(float) : 0u;
+        const NSUInteger pair_threads =
+            q4_scalar_pair ? 256u : 64u;
+        bool skip_pair = false;
         if (use_stream_expert_addr_table) {
             const int had_batch = g_batch_cb != nil;
-            if (had_batch && ds4_gpu_end_commands() == 0) {
+            /*
+             * Laguna overlap: the gate/up projections of the experts already
+             * cached start on the GPU before the CPU prepares and reads the
+             * missing ones, together with the independent work already queued
+             * (the shared expert, if the caller submitted the router alone).
+             * Without an open batch, or with DS4_LAGUNA_STREAM_BATCH_OVERLAP=0,
+             * the serial path remains: wait for everything, read, MoE.
+             */
+            /* split_pair always launches the Q4_K masked kernel: the guard
+             * stays here even though laguna_streaming already requires Q4_K. */
+            const int overlap = laguna_streaming && had_batch &&
+                                stream_addr_q4 &&
+                                !use_stream_grouped_addr_table &&
+                                ds4_gpu_laguna_stream_batch_overlap_enabled();
+            const int batch_timing = laguna_streaming &&
+                                     ds4_gpu_stream_expert_timing_summary_enabled();
+            double batch_t0 = batch_timing ? ds4_gpu_now_ms() : 0.0;
+            if (overlap) {
+                /* The router must be finished before reading its IDs. If the
+                 * caller has not already submitted it alone, it is in the open
+                 * batch: submit that. */
+                const int router_submitted =
+                    g_laguna_stream_batch_router_layer == layer_index + 1u;
+                g_laguna_stream_batch_router_layer = 0;
+                if (!router_submitted && !ds4_gpu_flush_commands()) return 0;
+                if (!ds4_gpu_wait_pending_command_buffers(
+                            "Laguna streaming batch router")) {
+                    return 0;
+                }
+            } else if (had_batch && ds4_gpu_end_commands() == 0) {
                 return 0;
+            }
+            if (batch_timing) {
+                const double now_ms = ds4_gpu_now_ms();
+                g_laguna_stream_batch_sync_ms += now_ms - batch_t0;
+                batch_t0 = now_ms;
+            }
+
+            uint32_t resident_mask[DS4_LAGUNA_STREAM_EXPERT_MASK_WORDS];
+            uint32_t missing_mask[DS4_LAGUNA_STREAM_EXPERT_MASK_WORDS];
+            ds4_gpu_stream_expert_cache_entry
+                *resident_entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+            uint32_t n_resident = 0, n_missing = 0;
+            const int classified = (overlap || batch_timing) &&
+                ds4_gpu_laguna_stream_batch_classify(
+                        model_map, model_size, layer_index, selected,
+                        n_tokens * n_expert, n_total_expert,
+                        gate_offset, up_offset, down_offset,
+                        gate_expert_bytes, down_expert_bytes,
+                        resident_mask, missing_mask, resident_entries,
+                        &n_resident, &n_missing);
+            if (classified && batch_timing) {
+                g_laguna_stream_batch_layers++;
+                g_laguna_stream_batch_resident_experts += n_resident;
+                g_laguna_stream_batch_missing_experts += n_missing;
+                if (n_missing == 0) g_laguna_stream_batch_all_resident++;
+                else if (n_resident == 0) g_laguna_stream_batch_all_missing++;
+                else g_laguna_stream_batch_mixed++;
+            }
+            /* Nothing to read: nothing to overlap, and an extra GPU round trip
+             * would only cost time. */
+            const int overlap_io = overlap && classified && n_missing != 0;
+            const int split_pair = overlap_io && n_resident != 0;
+            if (split_pair) {
+                /* First half of the gate/up pair: resident experts only. The
+                 * entries stay marked in flight with this command buffer. */
+                id<MTLComputePipelineState> masked_pipeline = ds4_gpu_hot_pipeline(
+                        g_laguna_q4_k_addr_pair_swiglu_expert_masked_pipeline,
+                        "kernel_laguna_q4_K_addr_pair_swiglu_f32_expert_masked");
+                id<MTLBuffer> gate_table = nil, up_table = nil, down_table = nil;
+                if (!masked_pipeline ||
+                    !ds4_gpu_stream_expert_cache_addr_buffers(layer_index,
+                                                              &gate_table,
+                                                              &up_table,
+                                                              &down_table) ||
+                    !ds4_gpu_stream_expert_cache_mark_entries_inflight(resident_entries,
+                                                                       n_resident,
+                                                                       0) ||
+                    !ds4_gpu_laguna_stream_encode_masked_pair(
+                            g_batch_cb, masked_pipeline, &args,
+                            pair_x_groups, pair_threads, n_expert, n_tokens,
+                            gate_table, up_table, x, selected, weights, mid,
+                            resident_mask, resident_entries, n_resident)) {
+                    return 0;
+                }
+            }
+            if (overlap_io && g_batch_has_work) {
+                if (!ds4_gpu_flush_commands()) return 0;
+                if (batch_timing) {
+                    const double now_ms = ds4_gpu_now_ms();
+                    g_laguna_stream_batch_submit_ms += now_ms - batch_t0;
+                    batch_t0 = now_ms;
+                }
+                if (split_pair) g_laguna_stream_batch_overlap_layers++;
             }
             if (!ds4_gpu_stream_expert_cache_prepare_selected_batch(
                         model_map,
@@ -37070,15 +37386,60 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                         &stream_overflow_up,
                         &stream_overflow_down,
                         laguna_streaming)) {
+                if (overlap) {
+                    /* The failed preparation has already cleared the layer, but
+                     * it skipped the resident entries still in flight in the
+                     * first half while zeroing the count anyway. Repeat it once
+                     * the GPU is done, so count and entries agree again. */
+                    (void)ds4_gpu_wait_pending_command_buffers(
+                            "Laguna streaming batch failure");
+                    ds4_gpu_stream_expert_cache_clear_layer(layer_index);
+                }
                 return 0;
+            }
+            if (batch_timing) {
+                const double now_ms = ds4_gpu_now_ms();
+                g_laguna_stream_batch_io_ms += now_ms - batch_t0;
+                batch_t0 = now_ms;
+            }
+            if (overlap) {
+                /* The second half and the down projection read the mid written
+                 * by the first: wait for the command buffer submitted before
+                 * the read, which is usually already done by now. */
+                if (!ds4_gpu_wait_pending_command_buffers(
+                            "Laguna streaming batch resident")) {
+                    ds4_gpu_stream_expert_cache_clear_layer(layer_index);
+                    return 0;
+                }
+                if (batch_timing) {
+                    g_laguna_stream_batch_tail_wait_ms += ds4_gpu_now_ms() - batch_t0;
+                }
             }
             if (stream_unique == 0) {
                 ds4_gpu_stream_expert_cache_clear_layer(layer_index);
                 return 0;
             }
-            if (had_batch && ds4_gpu_begin_commands() == 0) {
+            if (!overlap && had_batch && ds4_gpu_begin_commands() == 0) {
                 ds4_gpu_stream_expert_cache_clear_layer(layer_index);
                 return 0;
+            }
+            if (split_pair) {
+                /* Second half: only the missing experts, now installed; then
+                 * the single down projection over the whole mid, in the usual
+                 * slot order. */
+                id<MTLComputePipelineState> masked_pipeline = ds4_gpu_hot_pipeline(
+                        g_laguna_q4_k_addr_pair_swiglu_expert_masked_pipeline,
+                        "kernel_laguna_q4_K_addr_pair_swiglu_f32_expert_masked");
+                if (!ds4_gpu_laguna_stream_encode_masked_pair(
+                            g_batch_cb, masked_pipeline, &args,
+                            pair_x_groups, pair_threads, n_expert, n_tokens,
+                            stream_gate_addr_buf, stream_up_addr_buf,
+                            x, selected, weights, mid,
+                            missing_mask, stream_resources,
+                            stream_resource_count)) {
+                    return 0;
+                }
+                skip_pair = true;
             }
             if (use_stream_grouped_addr_table) {
                 return ds4_gpu_glm_routed_moe_batch_grouped_addr_tensor(
@@ -37188,39 +37549,6 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             } \
         } while (0)
 
-        ds4_gpu_glm_routed_moe_args args = {
-            .tp_rank = g_tp_split_rank,
-            .tp_world = g_tp_split_world,
-            .tp_expert_base = (int32_t)first_expert,
-            .in_dim = expert_in_dim,
-            .mid_dim = expert_mid_dim,
-            .out_dim = out_dim,
-            .n_total_expert = n_total_expert,
-            .n_expert_used = n_expert,
-            .n_tokens = n_tokens,
-            .mid_token_stride = mid_token_stride,
-            .down_type = down_type,
-            .gate_expert_bytes = gate_expert_bytes,
-            .gate_row_bytes = gate_row_bytes,
-            .up_expert_bytes = up_expert_bytes,
-            .up_row_bytes = up_row_bytes,
-            .down_expert_bytes = down_expert_bytes,
-            .down_row_bytes = down_row_bytes,
-        };
-        const NSUInteger pair_x_groups =
-            gate_pair_q2 ? (use_stream_expert_addr_table ?
-                            (NSUInteger)((expert_mid_dim + 1u) / 2u) :
-                            (NSUInteger)((expert_mid_dim + 7u) / 8u)) :
-            gate_pair_q3 ? (NSUInteger)((expert_mid_dim + 3u) / 4u) :
-            gate_pair_q5 ? (NSUInteger)((expert_mid_dim + 7u) / 8u) :
-            use_stream_expert_addr_table ? (NSUInteger)((expert_mid_dim + 3u) / 4u) :
-            q4_scalar_pair ? (NSUInteger)expert_mid_dim :
-            q4_pair2 ? (NSUInteger)((expert_mid_dim + 1u) / 2u) :
-            (NSUInteger)((expert_mid_dim + 7u) / 8u);
-        const NSUInteger pair_threadgroup_bytes =
-            q4_scalar_pair ? 512u * sizeof(float) : 0u;
-        const NSUInteger pair_threads =
-            q4_scalar_pair ? 256u : 64u;
         const NSUInteger down_x_groups =
             down_scalar_q2 ? (NSUInteger)((out_dim + 7u) / 8u) :
             down_simd_q3 ? (NSUInteger)((out_dim + 3u) / 4u) :
@@ -37239,35 +37567,38 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             return 0;
         }
 
-        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:pair_pipeline];
-        [enc setBytes:&args length:sizeof(args) atIndex:0];
-        [enc setBuffer:use_stream_expert_addr_table ? stream_gate_addr_buf : gatebuf
-                offset:use_stream_expert_addr_table ? 0u : (NSUInteger)gate_inner
-               atIndex:1];
-        [enc setBuffer:use_stream_expert_addr_table ? stream_up_addr_buf : upbuf
-                offset:use_stream_expert_addr_table ? 0u : (NSUInteger)up_inner
-               atIndex:2];
-        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
-        [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:4];
-        [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:5];
-        [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:6];
-        if (use_stream_expert_addr_table) {
-            for (uint32_t i = 0; i < stream_resource_count; i++) {
-                [enc useResource:stream_resources[i]->gate_buffer usage:MTLResourceUsageRead];
-                [enc useResource:stream_resources[i]->up_buffer usage:MTLResourceUsageRead];
+        id<MTLComputeCommandEncoder> enc = nil;
+        if (!skip_pair) {
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:pair_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:use_stream_expert_addr_table ? stream_gate_addr_buf : gatebuf
+                    offset:use_stream_expert_addr_table ? 0u : (NSUInteger)gate_inner
+                   atIndex:1];
+            [enc setBuffer:use_stream_expert_addr_table ? stream_up_addr_buf : upbuf
+                    offset:use_stream_expert_addr_table ? 0u : (NSUInteger)up_inner
+                   atIndex:2];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
+            [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:4];
+            [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:5];
+            [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:6];
+            if (use_stream_expert_addr_table) {
+                for (uint32_t i = 0; i < stream_resource_count; i++) {
+                    [enc useResource:stream_resources[i]->gate_buffer usage:MTLResourceUsageRead];
+                    [enc useResource:stream_resources[i]->up_buffer usage:MTLResourceUsageRead];
+                }
+                if (stream_overflow_gate) [enc useResource:stream_overflow_gate usage:MTLResourceUsageRead];
+                if (stream_overflow_up) [enc useResource:stream_overflow_up usage:MTLResourceUsageRead];
             }
-            if (stream_overflow_gate) [enc useResource:stream_overflow_gate usage:MTLResourceUsageRead];
-            if (stream_overflow_up) [enc useResource:stream_overflow_up usage:MTLResourceUsageRead];
+            if (pair_threadgroup_bytes != 0u) {
+                [enc setThreadgroupMemoryLength:pair_threadgroup_bytes atIndex:0];
+            }
+            [enc dispatchThreadgroups:MTLSizeMake(pair_x_groups,
+                                                  (NSUInteger)n_expert,
+                                                  (NSUInteger)n_tokens)
+                 threadsPerThreadgroup:MTLSizeMake(pair_threads, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
         }
-        if (pair_threadgroup_bytes != 0u) {
-            [enc setThreadgroupMemoryLength:pair_threadgroup_bytes atIndex:0];
-        }
-        [enc dispatchThreadgroups:MTLSizeMake(pair_x_groups,
-                                              (NSUInteger)n_expert,
-                                              (NSUInteger)n_tokens)
-             threadsPerThreadgroup:MTLSizeMake(pair_threads, 1, 1)];
-        ds4_gpu_end_compute_encoder(cb, enc);
         DS4_METAL_PROFILE_GLM_MOE_BATCH_STAGE("pair");
 
         enc = ds4_gpu_compute_encoder(cb);
