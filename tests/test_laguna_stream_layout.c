@@ -336,19 +336,27 @@ static uint64_t laguna_graph_alloc_formula(uint32_t rows) {
 
 static void check_memory_admission(void) {
     uint64_t kv, scratch;
-    assert(laguna_stream_graph_bytes(256, &kv, &scratch));
-    assert(kv == 48ull * 256 * 1024 * 2 * 2);
-    assert(scratch > 0 && scratch < 1048576);
     const char *chunk_env = getenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK");
     char *saved_chunk_env = chunk_env ? strdup(chunk_env) : NULL;
     uint32_t chunk = 0;
+    assert(unsetenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK") == 0);
+    assert(laguna_stream_prefill_chunk_from_env(&chunk) &&
+           chunk == DS4_LAGUNA_STREAM_PREFILL_CHUNK_DEFAULT);
+    assert(laguna_stream_graph_bytes(256, chunk, &kv, &scratch));
+    assert(kv == 48ull * 256 * 1024 * 2 * 2);
+    assert(scratch == laguna_graph_alloc_formula(8));
+    assert(laguna_stream_prefill_cache_chunk(8, 90) == 8);
+    assert(laguna_stream_prefill_cache_chunk(8, 89) == 7);
+    assert(laguna_stream_prefill_cache_chunk(8, 50) == 4);
+    assert(laguna_stream_prefill_cache_chunk(8, 29) == 1);
+    assert(laguna_stream_prefill_cache_chunk(8, 9) == 0);
     const uint32_t chunks[] = {1, 2, 4, 8, 32};
     for (unsigned i = 0; i < sizeof(chunks) / sizeof(chunks[0]); i++) {
         char value[4];
         snprintf(value, sizeof(value), "%u", chunks[i]);
         assert(setenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK", value, 1) == 0);
         assert(laguna_stream_prefill_chunk_from_env(&chunk) && chunk == chunks[i]);
-        assert(laguna_stream_graph_bytes(256, &kv, &scratch));
+        assert(laguna_stream_graph_bytes(256, chunk, &kv, &scratch));
         assert(scratch == laguna_graph_alloc_formula(chunks[i]));
     }
     assert(setenv("DS4_LAGUNA_STREAM_PREFILL_CHUNK", "0", 1) == 0);
@@ -362,28 +370,33 @@ static void check_memory_admission(void) {
     uint64_t previous = 0;
     for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
         const uint32_t ctx = contexts[i], swa = ctx < 512 ? ctx : 512;
-        assert(laguna_stream_graph_bytes(ctx, &kv, &scratch));
+        assert(laguna_stream_graph_bytes(ctx, 1, &kv, &scratch));
         /* Twelve full layers and thirty-six SWA layers, fp16 KV. */
         assert(kv == (12ull * ctx + 36ull * swa) * 1024 * 2 * 2);
         assert(kv > previous && scratch == laguna_graph_alloc_formula(1));
         previous = kv;
         const uint64_t rec = 48ull << 30, non_routed = 5ull << 30;
-        assert(laguna_stream_available_cache_bytes(rec, non_routed, ctx) ==
+        assert(laguna_stream_available_cache_bytes(rec, non_routed, ctx, 1) ==
                rec / 5 * 4 - non_routed - kv - scratch - (1ull << 30));
-        const uint64_t cap = laguna_stream_available_cache_bytes(rec, non_routed, ctx);
+        const uint64_t cap = laguna_stream_available_cache_bytes(
+            rec, non_routed, ctx, 1);
         laguna_stream_cache_config config;
         assert(laguna_stream_configure_cache(5308416, 0, 0, cap, &config));
         assert(config.experts == 1618 && config.budget_bytes == (8ull << 30));
         assert(!laguna_stream_configure_cache(5308416, 0, cap + 1, cap, &config));
     }
-    assert(!laguna_stream_graph_bytes(0, &kv, &scratch));
-    assert(!laguna_stream_graph_bytes(UINT32_MAX, &kv, &scratch));
+    assert(!laguna_stream_graph_bytes(0, 1, &kv, &scratch));
+    assert(!laguna_stream_graph_bytes(UINT32_MAX, 1, &kv, &scratch));
+    assert(!laguna_stream_graph_bytes(256, 0, &kv, &scratch));
+    assert(!laguna_stream_graph_bytes(256, 33, &kv, &scratch));
     const uint64_t gib = 1ull << 30, entry = 5308416;
-    const uint64_t cap = laguna_stream_available_cache_bytes(48 * gib, 5 * gib, 256);
+    const uint64_t cap = laguna_stream_available_cache_bytes(
+        48 * gib, 5 * gib, 256, 8);
     assert(cap > 8 * gib);
-    assert(!laguna_stream_available_cache_bytes(0, 5 * gib, 256));
-    assert(!laguna_stream_available_cache_bytes(48 * gib, UINT64_MAX, 256));
-    assert(!laguna_stream_available_cache_bytes(6 * gib, 5 * gib, 256));
+    assert(!laguna_stream_available_cache_bytes(0, 5 * gib, 256, 8));
+    assert(!laguna_stream_available_cache_bytes(
+        48 * gib, UINT64_MAX, 256, 8));
+    assert(!laguna_stream_available_cache_bytes(6 * gib, 5 * gib, 256, 8));
     laguna_stream_cache_config cache;
     assert(laguna_stream_configure_cache(entry, 0, 0, cap, &cache));
     assert(cache.experts == 1618 && cache.budget_bytes == 8 * gib);
