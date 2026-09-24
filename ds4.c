@@ -57508,6 +57508,11 @@ int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, 
 }
 
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
+    /* Laguna has none of the HC tensors this diagnostic needs. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        fprintf(stderr, "ds4: --head-test is not supported for Laguna (no HC tensors)\n");
+        return 1;
+    }
     if (!prompt || prompt->len <= 0) {
         fprintf(stderr, "ds4: head test requires a non-empty prompt\n");
         return 1;
@@ -59795,6 +59800,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     ds4_str streaming_arch = {0};
+    /* Reject before binding and residency, even without streaming. */
+    if (opt->head_test &&
+        model_get_string(&e->model, "general.architecture", &streaming_arch) &&
+        ds4_streq(streaming_arch, "laguna")) {
+        fprintf(stderr, "ds4: --head-test is not supported for Laguna (no HC tensors)\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
     if (e->ssd_streaming &&
         model_get_string(&e->model, "general.architecture", &streaming_arch) &&
         ds4_streq(streaming_arch, "laguna")) {
@@ -61173,6 +61187,24 @@ static int ds4_session_tp_register(ds4_session *s) {
     s->tp_session_id = id;
     return 1;
 }
+
+#if defined(DS4_TEST_HOOKS) && !defined(DS4_NO_GPU)
+/* Drive the batch > 1 path directly: the public APIs already split into rows.
+ * Only the test binary exports this entry point; it is not a production API. */
+int ds4_test_laguna_stream_batch(ds4_engine *e, const ds4_tokens *prompt,
+                                int ctx, float *logits, int logits_cap) {
+    if (!e || !e->ssd_streaming || !prompt || prompt->len < 1 ||
+        !logits || logits_cap != (int)DS4_N_VOCAB ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) return 0;
+    ds4_laguna_gpu_graph g;
+    if (!laguna_graph_alloc(&g, (uint32_t)ctx, true)) return 0;
+    const int ok = laguna_graph_forward_batch(&g, &e->model, &e->weights,
+        prompt->v, NULL, (uint32_t)prompt->len, 0, logits, NULL, NULL,
+        NULL, NULL, prompt->len);
+    laguna_graph_free(&g);
+    return ok;
+}
+#endif
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;

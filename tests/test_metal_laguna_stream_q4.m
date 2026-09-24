@@ -74,7 +74,12 @@ static int run_case(bool rectangular, laguna_stream_fixture *previous) {
         ds4_gpu_set_ssd_streaming(true);
         assert(ds4_gpu_set_model_fd(fileno(f.file)));
         const uint64_t offset = 0, size = FIX_PREFIX;
-        assert(ds4_gpu_set_model_map_spans(f.map, f.size, &offset, &size, 1, FIX_PREFIX));
+    assert(ds4_gpu_set_model_map_spans(f.map, f.size, &offset, &size, 1, FIX_PREFIX));
+    /* Positive counter check: zero fallbacks is not enough if the counter is
+     * off. */
+    uint64_t inner = UINT64_MAX, views = g_test_model_range_calls;
+    assert(ds4_gpu_wrap_model_range(f.map, f.size, 0, 16, &inner));
+    assert(g_test_model_range_calls == views + 1 && inner == 0);
         ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(f.out_dim * sizeof(float));
         ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(10 * f.mid_dim * sizeof(float));
         ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(f.in_dim * sizeof(float));
@@ -86,7 +91,8 @@ static int run_case(bool rectangular, laguna_stream_fixture *previous) {
         float input[512];
         for (unsigned c = 0; c < f.in_dim; c++)
             input[c] = rectangular ? (1.0f + c % 17) / (9 * f.in_dim) : 1.0f / f.in_dim;
-        assert(ds4_gpu_tensor_write(x, 0, input, f.in_dim * sizeof(float)));
+    assert(ds4_gpu_tensor_write(x, 0, input, f.in_dim * sizeof(float)));
+    assert(f.in_dim > 0 && f.mid_dim > 0 && f.out_dim > 0);
 
         const uint64_t bytes = 2 * f.desc.gate_expert_bytes + f.desc.down_expert_bytes;
         uint64_t slot_bytes = 0, limit = 0;
@@ -139,7 +145,12 @@ static int run_case(bool rectangular, laguna_stream_fixture *previous) {
             assert(g_stream_expert_timing_prepare_buffer_calls - buffers == (pass == 0 ? 10 : 0));
             assert(g_stream_expert_cache_pread_bytes - reads ==
                    (10 - expected_hits) * (2 * f.desc.gate_expert_bytes + f.desc.down_expert_bytes));
-            assert(ds4_gpu_stream_expert_cache_current_count() == 10);
+        assert(ds4_gpu_stream_expert_cache_current_count() == 10);
+        unsigned occupied = 0;
+        for (unsigned il = 0; il < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; il++)
+            for (unsigned e = 0; e < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; e++)
+                occupied += g_stream_expert_cache[il][e].valid != 0;
+        assert(occupied == 10);
             assert(g_stream_expert_cache_buffer_allocs == expected_allocs);
             assert(g_stream_expert_cache_slab_count == (slabs ? expected_allocs : 0));
             assert(ds4_gpu_end_commands());
@@ -343,6 +354,134 @@ static int check_slab_capacity(void) {
     return 1;
 }
 
+static void check_legacy_selection_limit(void) {
+    /* The two extra physical slots do not enable the legacy
+     * early-load/prefetch. */
+    static const char sentinel;
+    ds4_gpu_stream_expert_table table = {.model_map = &sentinel,
+        .model_size = 1048576, .layer = 1, .n_total_expert = 256,
+        .gate_offset = 0, .up_offset = 262144, .down_offset = 524288,
+        .gate_expert_bytes = 144, .down_expert_bytes = 144};
+    int32_t ids[10] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    assert(unsetenv("DS4_METAL_DISABLE_STREAMING_EXPERT_EARLY_LOAD") == 0);
+    assert(unsetenv("DS4_METAL_DISABLE_GLM_STREAMING_EXPERT_EARLY_LOAD") == 0);
+    g_ssd_streaming_mode = 1;
+    for (unsigned n = 9; n <= 10; n++) {
+        assert(ds4_gpu_stream_expert_cache_begin_selected_load(&table, ids, n));
+        assert(!g_stream_expert_pending_load.active);
+        assert(ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+            &table, (const ds4_gpu_tensor *)(uintptr_t)1, n));
+        ds4_gpu_glm_stream_selected_prefetch_set(&table, ids, n);
+        assert(!g_glm_stream_selected_prefetch.active);
+        assert(!g_stream_expert_cache_entry_count && !g_stream_expert_cache_buffer_allocs);
+    }
+    g_ssd_streaming_mode = 0;
+    puts("laguna-stream-legacy-limit: OK (9/10 remain unsupported)");
+}
+
+static int check_saturation(bool slabs) {
+    @autoreleasepool {
+        /* Same slot count as the real 8 GiB cache; payload 48 times smaller. */
+        laguna_stream_fixture f = fixture_open_case(false);
+        if (slabs) assert(unsetenv("DS4_METAL_DISABLE_STREAMING_EXPERT_SLABS") == 0);
+        else assert(setenv("DS4_METAL_DISABLE_STREAMING_EXPERT_SLABS", "1", 1) == 0);
+        assert(setenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB", "90", 1) == 0);
+        if (!ds4_gpu_init()) { fixture_close(&f); return 0; }
+        ds4_gpu_set_ssd_streaming(true);
+        ds4_gpu_set_streaming_expert_cache_budget(1618);
+        assert(ds4_gpu_set_model_fd(fileno(f.file)));
+        const uint64_t off = 0, len = FIX_PREFIX;
+        assert(ds4_gpu_set_model_map_spans(f.map, f.size, &off, &len, 1, len));
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(FIX_DIM * sizeof(float));
+        ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(10 * FIX_DIM * sizeof(float));
+        ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(FIX_DIM * sizeof(float));
+        ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(10 * sizeof(int32_t));
+        ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(10 * sizeof(float));
+        assert(out && mid && x && selected && weights);
+        float input[FIX_DIM], ws[10]; int32_t ids[10];
+        for (unsigned i = 0; i < FIX_DIM; i++) input[i] = 1.0f / FIX_DIM;
+        for (unsigned i = 0; i < 10; i++) ws[i] = 0.1f;
+        assert(ds4_gpu_tensor_write(x, 0, input, sizeof(input)));
+        assert(ds4_gpu_tensor_write(weights, 0, ws, sizeof(ws)));
+        uint64_t slot = 0, limit = 0;
+        const uint64_t bytes = 2 * f.desc.gate_expert_bytes + f.desc.down_expert_bytes;
+        assert(bytes * 48 == 5308416);
+        assert(ds4_gpu_laguna_stream_allocation_limit(bytes, 1618, &slot, &limit));
+        unsigned total = 0, calls = 0;
+        const uint64_t views = g_test_model_range_calls;
+        g_test_laguna_stream_peak_allocated_bytes = 0;
+        for (unsigned layer = 1; layer <= 7; layer++) {
+            const unsigned count = layer == 7 ? 82 : 256;
+            for (unsigned done = 0; done < count; done += 10) {
+                const unsigned added = count - done < 10 ? count - done : 10;
+                const unsigned first = added < 10 ? count - 10 : done;
+                for (unsigned i = 0; i < 10; i++) ids[i] = (int32_t)(first + i);
+                assert(ds4_gpu_tensor_write(selected, 0, ids, sizeof(ids)));
+                uint64_t misses = g_stream_expert_cache_misses;
+                assert(ds4_gpu_laguna_stream_routed_moe_one_tensor(
+                    out, mid, f.map, f.size, &f.desc, FIX_DIM, FIX_DIM, FIX_DIM,
+                    selected, weights, FIX_TOTAL, 10, layer, x));
+                total += added; calls++;
+                assert(g_stream_expert_cache_misses - misses == added);
+                assert(ds4_gpu_stream_expert_cache_current_count() == total);
+                assert(g_laguna_stream_allocated_bytes <= limit);
+            }
+        }
+        unsigned occupied = 0;
+        for (unsigned il = 0; il < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; il++)
+            for (unsigned e = 0; e < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; e++)
+                occupied += g_stream_expert_cache[il][e].valid != 0;
+        assert(total == 1618 && occupied == 1618);
+        assert(g_stream_expert_cache_slab_count == (slabs ? 2u : 0u));
+        assert(g_stream_expert_cache_buffer_allocs == (slabs ? 2u : 1618u));
+        assert(g_test_laguna_stream_peak_allocated_bytes == limit);
+        const uint64_t allocs = g_stream_expert_cache_buffer_allocs;
+        /* Reset the hotness of the old prompt: the overlapping tails must not
+         * artificially protect some victims of the first saturation. */
+        ds4_gpu_stream_expert_cache_reset_route_hotness();
+        /* Replace every entry, then read the whole set back as hits. */
+        for (unsigned pass = 0; pass < 2; pass++) {
+            const uint64_t evictions = g_stream_expert_cache_evictions;
+            unsigned reused = 0;
+            for (unsigned layer = 8; layer <= 14; layer++) {
+                const unsigned count = layer == 14 ? 82 : 256;
+                for (unsigned done = 0; done < count; done += 10) {
+                    const unsigned added = count - done < 10 ? count - done : 10;
+                    const unsigned first = added < 10 ? count - 10 : done;
+                    for (unsigned i = 0; i < 10; i++) ids[i] = (int32_t)(first + i);
+                    assert(ds4_gpu_tensor_write(selected, 0, ids, sizeof(ids)));
+                    const uint64_t reads = g_stream_expert_cache_pread_bytes;
+                    assert(ds4_gpu_laguna_stream_routed_moe_one_tensor(
+                        out, mid, f.map, f.size, &f.desc, FIX_DIM, FIX_DIM, FIX_DIM,
+                        selected, weights, FIX_TOTAL, 10, layer, x));
+                    calls++; reused += added;
+                    assert(g_stream_expert_cache_pread_bytes - reads == (pass == 0 ? added * bytes : 0));
+                    assert(ds4_gpu_stream_expert_cache_current_count() == 1618);
+                    assert(g_stream_expert_cache_buffer_allocs == allocs);
+                }
+            }
+            assert(reused == 1618);
+            assert(g_stream_expert_cache_evictions - evictions == (pass == 0 ? 1618 : 0));
+        }
+        occupied = 0;
+        for (unsigned il = 0; il < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; il++)
+            for (unsigned e = 0; e < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; e++) {
+                const bool expected = il >= 8 && il <= 14 && e < (il == 14 ? 82u : 256u);
+                assert((g_stream_expert_cache[il][e].valid != 0) == expected);
+                occupied += expected;
+            }
+        assert(occupied == 1618);
+        assert(g_laguna_stream_moe_calls == calls && g_laguna_stream_token_rows == 26);
+        assert(!g_stream_expert_cache_decode_tokens && !g_laguna_stream_failures);
+        assert(g_test_model_range_calls == views);
+        ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(weights);
+        ds4_gpu_cleanup(); assert_cache_drained(); fixture_close(&f);
+        printf("laguna-stream-saturation: OK (1618 slots, slabs=%d, reuse, counters)\n", slabs);
+        return 1;
+    }
+}
+
 /* Exercise the same workers and fault hook without a Metal device. */
 static void check_pread_pool(void) {
     unsigned char source[30 * 64], loaded[sizeof(source)];
@@ -375,6 +514,9 @@ static void check_pread_pool(void) {
         if (ok) {
             assert(read_calls == 31 && bytes == sizeof(source));
             assert(memcmp(source, loaded, sizeof(source)) == 0);
+        } else {
+            assert(read_calls >= fail_read && fail_read > 0);
+            assert(bytes < sizeof(source));
         }
         g_test_laguna_stream_pread = NULL;
         g_test_laguna_stream_temporary_bytes = 0;
@@ -391,6 +533,7 @@ int main(int argc, char **argv) {
     assert(setenv("DS4_METAL_STREAMING_EXPERT_PREAD_POOL", "1", 1) == 0);
     assert(setenv("DS4_METAL_STREAMING_EXPERT_PREAD_THREADS", "9", 1) == 0);
     check_allocation_limits();
+    check_legacy_selection_limit();
     check_pread_pool();
     if (argc == 2 && strcmp(argv[1], "--pread-only") == 0) return 0;
     assert(unsetenv("DS4_METAL_DISABLE_STREAMING_EXPERT_COMBINED_BUFFER") == 0);
@@ -405,5 +548,7 @@ int main(int argc, char **argv) {
         if (run_case(false, &previous) || run_case(true, &previous)) return 1;
     }
     fixture_close(&previous);
+    assert(check_saturation(true));
+    assert(check_saturation(false));
     return 0;
 }

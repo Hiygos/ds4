@@ -28,6 +28,7 @@
 /tests/test_laguna_stream_q4
 /tests/test_laguna_stream_layout
 /tests/test_metal_laguna_stream_q4
+/tests/test_laguna_stream_engine
 /tests/test_sampling
 *.o
 *.dSYM/

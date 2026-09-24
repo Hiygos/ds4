@@ -402,8 +402,8 @@ q4k-dot-test: tests/test_q4k_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
 	./tests/test_q4k_dot
 
-tests/test_laguna_stream_q4: tests/test_laguna_stream_q4.c tests/laguna_stream_q4_fixture.h ds4_stream_q4.h ds4_gpu.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -I. -o $@ $< $(LDLIBS)
+tests/test_laguna_stream_q4: tests/test_laguna_stream_q4.c tests/laguna_stream_q4_fixture.h ds4_stream_q4.h ds4_gpu.h Makefile
+	$(CC) $(CFLAGS) -fno-fast-math -DDS4_NO_GPU -I. -o $@ $< $(LDLIBS)
 
 .PHONY: laguna-stream-q4-host-test
 laguna-stream-q4-host-test: tests/test_laguna_stream_q4
@@ -417,11 +417,19 @@ laguna-stream-layout-host-test: tests/test_laguna_stream_layout
 	./tests/test_laguna_stream_layout
 
 ifeq ($(UNAME_S),Darwin)
-tests/test_metal_laguna_stream_q4: tests/test_metal_laguna_stream_q4.m tests/laguna_stream_q4_fixture.h ds4_metal.m ds4_stream_q4.h ds4_gpu.h $(METAL_SRCS) $(filter-out ds4_metal.o,$(CORE_OBJS))
-	$(CC) $(OBJCFLAGS) -I. -o $@ $< $(filter-out ds4_metal.o,$(CORE_OBJS)) $(METAL_LDLIBS)
+tests/test_metal_laguna_stream_q4: tests/test_metal_laguna_stream_q4.m tests/laguna_stream_q4_fixture.h ds4_metal.m ds4_stream_q4.h ds4_gpu.h Makefile $(METAL_SRCS) $(filter-out ds4_metal.o,$(CORE_OBJS))
+	$(CC) $(OBJCFLAGS) -fno-fast-math -I. -o $@ $< $(filter-out ds4_metal.o,$(CORE_OBJS)) $(METAL_LDLIBS)
+
+tests/ds4_laguna_stream_test.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_ssd.h Makefile
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -c -o $@ ds4.c
+
+tests/test_laguna_stream_engine: tests/test_laguna_stream_engine.m ds4_metal.m ds4.h ds4_gpu.h Makefile $(METAL_SRCS) tests/ds4_laguna_stream_test.o $(filter-out ds4.o ds4_metal.o,$(CORE_OBJS))
+	$(CC) $(OBJCFLAGS) -fno-fast-math -I. -o $@ $< tests/ds4_laguna_stream_test.o $(filter-out ds4.o ds4_metal.o,$(CORE_OBJS)) $(METAL_LDLIBS)
 endif
 
 clean:
 	rm -f tests/test_laguna_stream_layout
 	rm -f tests/test_laguna_stream_q4 tests/test_metal_laguna_stream_q4
+	rm -f tests/test_laguna_stream_engine
+	rm -f tests/ds4_laguna_stream_test.o
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

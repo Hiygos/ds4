@@ -165,6 +165,7 @@ typedef struct {
     /* Server batch mode serializes execution and can share prefill scratch. */
     bool share_session_prefill_workspace;
     bool first_token_test;
+    bool head_test;
     bool metal_graph_test;
     bool load_slice;
     uint32_t load_layer_start;

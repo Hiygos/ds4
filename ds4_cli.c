@@ -2098,6 +2098,7 @@ int main(int argc, char **argv) {
     }
     cfg.engine.inspect_only = cfg.inspect;
     cfg.engine.first_token_test = cfg.gen.first_token_test;
+    cfg.engine.head_test = cfg.gen.head_test;
     cfg.engine.metal_graph_test = cfg.gen.metal_graph_test;
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;

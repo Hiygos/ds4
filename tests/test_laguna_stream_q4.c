@@ -1,4 +1,4 @@
-/* Host-only bounds and file-offset checks; no Metal initialization. */
+/* Host checks of bounds and offsets, without Metal initialization. */
 #include "laguna_stream_q4_fixture.h"
 
 static int valid(const laguna_stream_fixture *f, uint32_t budget, const int32_t *ids) {
@@ -10,6 +10,9 @@ static int valid(const laguna_stream_fixture *f, uint32_t budget, const int32_t 
 
 static void run_case(bool rectangular) {
     laguna_stream_fixture f = fixture_open_case(rectangular);
+    /* These sizes make the cross-row comparisons non-vacuous too. */
+    assert(f.in_dim == (rectangular ? 512u : 256u));
+    assert(f.mid_dim == 256u && f.out_dim == f.in_dim);
     int32_t ids[DS4_STREAM_Q4_MAX_SELECTED] = {9, 8, 7, 6, 5, 4, 3, 2, 1, 0};
     assert(!valid(&f, 9, ids));
     assert(valid(&f, 10, ids));

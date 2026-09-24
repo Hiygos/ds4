@@ -338,6 +338,9 @@ static NSMutableArray<id<MTLBuffer>> *g_laguna_stream_buffers;
 static NSMutableArray<id<MTLBuffer>> *g_laguna_stream_free_buffers;
 static uint64_t g_laguna_stream_allocated_bytes;
 static uint64_t g_laguna_stream_wait_calls;
+/* Prefill and decode rows together: no GLM heuristic on layer 3. */
+static uint64_t g_laguna_stream_token_rows, g_laguna_stream_moe_calls;
+static uint64_t g_laguna_stream_failures;
 static double g_laguna_stream_wait_before_ms, g_laguna_stream_wait_after_ms;
 static uint64_t g_stream_expert_cache_hits;
 static uint64_t g_stream_expert_cache_misses;
@@ -9267,6 +9270,11 @@ void ds4_gpu_cleanup(void) {
         g_selected_readback_event_value = 0;
         [g_transient_buffers removeAllObjects];
         if (g_laguna_stream_wait_calls && ds4_gpu_stream_expert_timing_summary_enabled()) {
+            fprintf(stderr, "ds4: Laguna streaming rows=%llu moe_calls=%llu failures=%llu "
+                    "(prefill and decode; no GLM hotness decay)\n",
+                    (unsigned long long)g_laguna_stream_token_rows,
+                    (unsigned long long)g_laguna_stream_moe_calls,
+                    (unsigned long long)g_laguna_stream_failures);
             fprintf(stderr, "ds4: Laguna streaming GPU waits calls=%llu before_ms=%.3f after_ms=%.3f\n",
                     (unsigned long long)g_laguna_stream_wait_calls,
                     g_laguna_stream_wait_before_ms, g_laguna_stream_wait_after_ms);
@@ -11046,6 +11054,8 @@ static void ds4_gpu_laguna_stream_reset(void) {
     g_laguna_stream_free_buffers = nil;
     g_laguna_stream_allocated_bytes = 0;
     g_laguna_stream_wait_calls = 0;
+    g_laguna_stream_token_rows = g_laguna_stream_moe_calls = 0;
+    g_laguna_stream_failures = 0;
     g_laguna_stream_wait_before_ms = g_laguna_stream_wait_after_ms = 0;
     g_laguna_stream_cache_used = 0;
 }
@@ -14010,7 +14020,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
     if (!model_map || !selected_ids ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         n_selected == 0 ||
-        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED ||
+        n_selected > DS4_METAL_MAX_ROUTED_EXPERT_USED ||
         n_total_expert == 0 ||
         n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
         !ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
@@ -14309,7 +14319,8 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
         !entries ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         n_selected == 0 ||
-        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED ||
+        n_selected > (laguna ? DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED :
+                                 DS4_METAL_MAX_ROUTED_EXPERT_USED) ||
         n_total_expert == 0 ||
         n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
         !ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
@@ -14653,7 +14664,7 @@ static void ds4_gpu_glm_stream_selected_prefetch_set(
     g_glm_stream_selected_prefetch.active = 0;
     if (!table || !selected_ids ||
         n_selected == 0 ||
-        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED) {
+        n_selected > DS4_METAL_MAX_ROUTED_EXPERT_USED) {
         return;
     }
     g_glm_stream_selected_prefetch.model_map = table->model_map;
@@ -14716,7 +14727,7 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
     }
     if (!table || !selected ||
         n_selected == 0 ||
-        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED) {
+        n_selected > DS4_METAL_MAX_ROUTED_EXPERT_USED) {
         return 1;
     }
 
@@ -14816,7 +14827,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         n_tokens == 0 ||
         n_selected == 0 ||
-        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED ||
+        n_selected > DS4_METAL_MAX_ROUTED_EXPERT_USED ||
         n_total_expert == 0 ||
         n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
         gate_expert_bytes == 0 ||
@@ -34859,7 +34870,7 @@ static int ds4_gpu_glm_routed_moe_one_tensor_impl(
         fprintf(stderr, "ds4: Metal GLM routed MoE received inconsistent expert strides\n");
         return 0;
     }
-    if (layer_index == 3u) {
+    if (!require_cache && layer_index == 3u) {
         ds4_gpu_stream_expert_cache_note_decode_token();
     }
     if (gate_offset > model_size || gate_tensor_bytes > model_size - gate_offset ||
@@ -35631,7 +35642,13 @@ int ds4_gpu_laguna_stream_routed_moe_one_tensor(
         g_test_laguna_stream_temporary_bytes = 0;
 #endif
         if (had_batch && !ds4_gpu_begin_commands()) ok = 0;
-        if (!ok) fprintf(stderr, "ds4: Metal Laguna streaming Q4 consumer failed\n");
+        if (ok) {
+            g_laguna_stream_moe_calls++;
+            if (layer_index == 1u) g_laguna_stream_token_rows++;
+        } else {
+            g_laguna_stream_failures++;
+            fprintf(stderr, "ds4: Metal Laguna streaming Q4 consumer failed\n");
+        }
         return ok;
     }
 }

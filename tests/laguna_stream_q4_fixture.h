@@ -4,6 +4,9 @@
 #include "../ds4_gpu.h"
 #include "../ds4_stream_q4.h"
 #include <assert.h>
+#ifdef NDEBUG
+#error "Laguna tests require assertions"
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +14,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-enum { FIX_DIM = 256, FIX_TOTAL = 12, FIX_ROW = 144, FIX_PREFIX = 16384 };
+enum { FIX_DIM = 256, FIX_TOTAL = 256, FIX_ROW = 144, FIX_PREFIX = 16384 };
 
 typedef struct {
     FILE *file;

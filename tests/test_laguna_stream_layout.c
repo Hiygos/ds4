@@ -3,6 +3,9 @@
 #define DS4_TEST_HOOKS
 #include "../ds4.c"
 #include <assert.h>
+#ifdef NDEBUG
+#error "Laguna tests require assertions"
+#endif
 
 static ds4_tensor *add_tensor(ds4_model *m, uint32_t type, uint32_t ndim,
                               uint64_t d0, uint64_t d1, uint64_t d2) {
@@ -92,6 +95,7 @@ static void check_plan(const ds4_model *m, const ds4_weights *w) {
         }
     }
     assert(laguna_stream_model_spans(m, w, &spans, &non_routed, &routed));
+    assert(spans.len > 0 && spans.v && non_routed > 0);
     assert(routed == 47ull * 256 * 5308416);
     uint64_t span_bytes = 0, all_bytes = 0;
     for (uint32_t s = 0; s < spans.len; s++) {
@@ -123,6 +127,7 @@ static void check_plan(const ds4_model *m, const ds4_weights *w) {
 }
 
 static void check_rejections(ds4_model *m, ds4_weights *w) {
+    unsigned mutated = 0;
     for (uint32_t il = 0; il < 48; il++) {
         ds4_layer_weights *l = &w->layer[il];
         ds4_tensor *ts[] = {l->attn_q, l->attn_k, l->attn_v, l->attn_gate,
@@ -132,6 +137,7 @@ static void check_rejections(ds4_model *m, ds4_weights *w) {
             l->ffn_down_exps, l->ffn_gate_shexp, l->ffn_up_shexp, l->ffn_down_shexp};
         for (unsigned i = 0; i < sizeof(ts) / sizeof(*ts); i++) {
             if (!ts[i]) continue;
+            mutated++;
             const ds4_tensor saved = *ts[i];
             ts[i]->type = DS4_TENSOR_Q6_K;
             assert(!laguna_stream_layout_supported(m, w));
@@ -148,6 +154,7 @@ static void check_rejections(ds4_model *m, ds4_weights *w) {
         assert(!laguna_stream_layout_supported(m, w));
         g_ds4_head_counts[il] = heads;
     }
+    assert(mutated == 12 + 47 * 17);
     ds4_tensor *t = w->layer[47].ffn_up_exps;
     const ds4_tensor saved = *t;
     ds4_tensor boundary = saved;
@@ -292,6 +299,25 @@ static void check_memory_admission(void) {
     assert(laguna_stream_graph_bytes(256, &kv, &scratch));
     assert(kv == 48ull * 256 * 1024 * 2 * 2);
     assert(scratch > 0 && scratch < 1048576);
+    const uint64_t one_row_scratch = scratch;
+    const uint32_t contexts[] = {1, 256, 512, 513, 1024};
+    uint64_t previous = 0;
+    for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+        const uint32_t ctx = contexts[i], swa = ctx < 512 ? ctx : 512;
+        assert(laguna_stream_graph_bytes(ctx, &kv, &scratch));
+        /* Twelve full layers and thirty-six SWA layers, fp16 KV. */
+        assert(kv == (12ull * ctx + 36ull * swa) * 1024 * 2 * 2);
+        assert(kv > previous && scratch == one_row_scratch);
+        previous = kv;
+        const uint64_t rec = 48ull << 30, non_routed = 5ull << 30;
+        assert(laguna_stream_available_cache_bytes(rec, non_routed, ctx) ==
+               rec / 5 * 4 - non_routed - kv - scratch - (1ull << 30));
+        const uint64_t cap = laguna_stream_available_cache_bytes(rec, non_routed, ctx);
+        laguna_stream_cache_config config;
+        assert(laguna_stream_configure_cache(5308416, 0, 0, cap, &config));
+        assert(config.experts == 1618 && config.budget_bytes == (8ull << 30));
+        assert(!laguna_stream_configure_cache(5308416, 0, cap + 1, cap, &config));
+    }
     assert(!laguna_stream_graph_bytes(0, &kv, &scratch));
     assert(!laguna_stream_graph_bytes(UINT32_MAX, &kv, &scratch));
     const uint64_t gib = 1ull << 30, entry = 5308416;
@@ -306,6 +332,64 @@ static void check_memory_admission(void) {
     assert(!laguna_stream_configure_cache(entry, 0, cap + 1, cap, &cache));
     assert(laguna_stream_configure_cache(entry, 0, 0, 20 * entry, &cache));
     assert(cache.experts == 20);
+}
+
+static void check_engine_rejections(void) {
+    /* GGUF deliberately without weights: every rejection must come before
+     * binding. */
+    char path[] = "/tmp/laguna-flags-XXXXXX";
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+    FILE *fp = fdopen(fd, "wb");
+    assert(fp);
+    const uint32_t header[] = {DS4_GGUF_MAGIC, 3};
+    const uint64_t counts[] = {0, 1}, key_len = 20, value_len = 6;
+    const uint32_t string_type = 8;
+    assert(fwrite(header, sizeof(header), 1, fp) == 1);
+    assert(fwrite(counts, sizeof(counts), 1, fp) == 1);
+    assert(fwrite(&key_len, sizeof(key_len), 1, fp) == 1);
+    assert(fwrite("general.architecture", 20, 1, fp) == 1);
+    assert(fwrite(&string_type, sizeof(string_type), 1, fp) == 1);
+    assert(fwrite(&value_len, sizeof(value_len), 1, fp) == 1);
+    assert(fwrite("laguna", 6, 1, fp) == 1);
+    assert(fflush(fp) == 0 && ftruncate(fd, 128) == 0);
+    assert(fclose(fp) == 0);
+    const ds4_engine_options base = {.model_path = path,
+        .backend = DS4_BACKEND_METAL, .ssd_streaming = true};
+    ds4_engine_options cases[7] = {base, base, base, base, base, base, base};
+    cases[0].backend = DS4_BACKEND_CPU;
+    cases[1].backend = DS4_BACKEND_CUDA;
+    cases[2].dflash_path = "unused-draft.gguf";
+    cases[3].warm_weights = true;
+    cases[4].head_test = true;
+    cases[5].head_test = true; cases[5].ssd_streaming = false;
+    cases[6].mtp_path = "unused-mtp.gguf";
+    const char *messages[] = {"Metal backend", "Metal backend", "DFlash",
+        "--warm-weights", "--head-test is not supported for Laguna",
+        "--head-test is not supported for Laguna", "MTP"};
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        FILE *log = tmpfile();
+        assert(log);
+        int saved = dup(STDERR_FILENO);
+        assert(saved >= 0 && dup2(fileno(log), STDERR_FILENO) >= 0);
+        ds4_engine *engine = NULL;
+        int rc = ds4_engine_open(&engine, &cases[i]);
+        assert(fflush(stderr) == 0 && dup2(saved, STDERR_FILENO) >= 0);
+        close(saved);
+        rewind(log);
+        char error[2048] = {0};
+        assert(fread(error, 1, sizeof(error) - 1, log) > 0);
+        if (!strstr(error, messages[i])) fprintf(stderr, "case %u: %s", i, error);
+        assert(rc != 0 && engine == NULL && strstr(error, messages[i]));
+        fclose(log);
+    }
+    assert(unlink(path) == 0);
+    ds4_engine engine = {0};
+    int token = 2;
+    ds4_tokens prompt = {.v = &token, .len = 1};
+    assert(ds4_engine_head_test(&engine, &prompt) != 0);
+    engine.ssd_streaming = true;
+    assert(ds4_engine_head_test(&engine, &prompt) != 0);
 }
 
 int main(int argc, char **argv) {
@@ -326,6 +410,7 @@ int main(int argc, char **argv) {
     check_cache();
     check_streaming_requests();
     check_memory_admission();
+    check_engine_rejections();
     free(m.tensors);
     puts("laguna-stream-layout-host: OK (all layers, tables, spans, overflow, cache, flags, DFlash, memory)");
     return 0;
