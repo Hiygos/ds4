@@ -1,3 +1,24 @@
+> [!NOTE]
+> **About this fork.** This is a fork of [antirez/ds4](https://github.com/antirez/ds4)
+> that adds `--ssd-streaming` support for **Laguna S 2.1 Q4_K_M**, so the
+> 63.56 GiB model runs on a **64 GB Mac** without dropping below 4 bits. The
+> routed experts are read from the GGUF on demand into an 8 GiB Metal expert
+> cache; everything else stays resident.
+>
+> - **Tested on:** Mac Studio M2 Ultra, 64 GB, Metal, with the official Q4_K_M
+>   GGUF (`./download_model.sh laguna-q4`).
+> - **Speed:** about 9 tokens/s generation when macOS has free RAM for its
+>   page cache, about 6.3–6.6 tokens/s when reads hit the SSD. Peak footprint
+>   is about 8.6 GB.
+> - **Correctness:** checked token by token against llama.cpp up to 16k context.
+> - **Not supported:** DFlash/MTP under streaming, and other backends
+>   (ROCm/CUDA still need full residency). The GLM/DeepSeek streaming paths
+>   are unchanged.
+> - **Details, flags and full measurements:**
+>   [docs/LAGUNA-SSD-STREAMING.md](docs/LAGUNA-SSD-STREAMING.md).
+>
+> Not affiliated with antirez or poolside. The original README follows.
+
 <p align="center">
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
