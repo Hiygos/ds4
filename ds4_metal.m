@@ -13233,6 +13233,7 @@ retry:
 }
 
 static uint32_t ds4_gpu_stream_expert_cache_take_reusable_batch(
+        int                                     force_reuse,
         uint32_t                                n_needed,
         uint32_t                                protect_layer,
         const int32_t                          *protect_ids,
@@ -13254,7 +13255,8 @@ static uint32_t ds4_gpu_stream_expert_cache_take_reusable_batch(
     }
 
     const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
-    if (budget == 0 || g_stream_expert_cache_entry_count < budget) {
+    if (budget == 0 ||
+        (!force_reuse && g_stream_expert_cache_entry_count < budget)) {
         return 0;
     }
 
@@ -14261,6 +14263,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const double reuse_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
         batch_reuse_count =
             ds4_gpu_stream_expert_cache_take_reusable_batch(
+                    0,
                     p->n_loads,
                     layer,
                     selected_ids,
@@ -14562,6 +14565,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
         const double reuse_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
         batch_reuse_count =
             ds4_gpu_stream_expert_cache_take_reusable_batch(
+                    0,
                     n_loads,
                     layer,
                     selected_ids,
@@ -15065,6 +15069,51 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         }
         uint32_t reserved_entries = g_stream_expert_cache_entry_count;
 
+        /*
+         * With a full cache every miss of the union evicts one global victim.
+         * One scan of the whole table per miss dominates the preparation of
+         * batches with many misses per layer, so victims are taken in blocks of
+         * DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED with one scan per block,
+         * as in decode. Counting the misses touches neither statistics nor
+         * last_used, and it is a lower bound of the real misses: no extra entry
+         * is ever evicted. The whole union is protected, so the victims chosen
+         * in blocks are the same as the miss-by-miss choice and the cache ends
+         * up identical.
+         */
+        ds4_gpu_stream_expert_reusable_buffers
+            batch_reuse[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+        for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED; i++) {
+            batch_reuse[i] =
+                (ds4_gpu_stream_expert_reusable_buffers){ nil, nil, nil, 0, 0, 0 };
+        }
+        uint32_t batch_reuse_count = 0;
+        uint32_t batch_reuse_next = 0;
+        uint32_t batch_misses_left = 0;
+        if (laguna &&
+            cache_budget != 0 &&
+            reserved_entries >= cache_budget &&
+            ds4_gpu_stream_expert_batch_reuse_enabled(gate_expert_bytes,
+                                                      down_expert_bytes)) {
+            for (uint32_t u = 0; ok && u < unique_count; u++) {
+                const uint64_t expert = (uint64_t)(uint32_t)unique_ids[u];
+                /* The caller has already validated the whole tensors against
+                 * the model. */
+                const uint64_t gate_rel = expert * gate_expert_bytes;
+                const uint64_t down_rel = expert * down_expert_bytes;
+                if (!ds4_gpu_stream_expert_cache_entry_matches(
+                            &g_stream_expert_cache[layer][expert],
+                            model_map,
+                            model_size,
+                            gate_offset + gate_rel,
+                            up_offset + gate_rel,
+                            down_offset + down_rel,
+                            gate_expert_bytes,
+                            down_expert_bytes)) {
+                    batch_misses_left++;
+                }
+            }
+        }
+
         for (uint32_t u = 0; ok && u < unique_count; u++) {
             const uint32_t expert = (uint32_t)unique_ids[u];
 
@@ -15112,29 +15161,65 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                   gate_expert_bytes);
             ds4_gpu_stream_expert_readahead_range(unique_down_offsets[u],
                                                   down_expert_bytes);
-            const double buffer_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
-            const int prepared =
-                ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,
-                                                                 expert,
-                                                                 layer,
-                                                                 unique_ids,
-                                                                 unique_count,
-                                                                 gate_expert_bytes,
-                                                                 down_expert_bytes,
-                                                                 force_reuse,
-                                                                 &gate_bufs[n_loads],
-                                                                 &up_bufs[n_loads],
-                                                                 &down_bufs[n_loads],
-                                                                 &gate_inners[n_loads],
-                                                                 &up_inners[n_loads],
-                                                                 &down_inners[n_loads], 0);
-            if (load_timing) {
-                ds4_gpu_stream_expert_timing_note_prepare_buffer(
-                        ds4_gpu_now_ms() - buffer_t0);
+            if (batch_reuse_next == batch_reuse_count &&
+                batch_misses_left != 0) {
+                const uint32_t n_take =
+                    batch_misses_left < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED ?
+                    batch_misses_left : DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED;
+                const double reuse_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
+                batch_reuse_count =
+                    ds4_gpu_stream_expert_cache_take_reusable_batch(
+                            1,
+                            n_take,
+                            layer,
+                            unique_ids,
+                            unique_count,
+                            gate_expert_bytes,
+                            down_expert_bytes,
+                            batch_reuse);
+                batch_reuse_next = 0;
+                batch_misses_left -= n_take;
+                if (load_timing) {
+                    ds4_gpu_stream_expert_timing_note_prepare_batch_reuse(
+                            ds4_gpu_now_ms() - reuse_t0);
+                }
             }
-            if (!prepared) {
-                ok = 0;
-                break;
+            if (batch_reuse_next < batch_reuse_count) {
+                ds4_gpu_stream_expert_reusable_buffers *r =
+                    &batch_reuse[batch_reuse_next++];
+                gate_bufs[n_loads] = r->gate_buffer;
+                up_bufs[n_loads] = r->up_buffer;
+                down_bufs[n_loads] = r->down_buffer;
+                gate_inners[n_loads] = r->gate_inner;
+                up_inners[n_loads] = r->up_inner;
+                down_inners[n_loads] = r->down_inner;
+                *r = (ds4_gpu_stream_expert_reusable_buffers){
+                    nil, nil, nil, 0, 0, 0 };
+            } else {
+                const double buffer_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
+                const int prepared =
+                    ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,
+                                                                     expert,
+                                                                     layer,
+                                                                     unique_ids,
+                                                                     unique_count,
+                                                                     gate_expert_bytes,
+                                                                     down_expert_bytes,
+                                                                     force_reuse,
+                                                                     &gate_bufs[n_loads],
+                                                                     &up_bufs[n_loads],
+                                                                     &down_bufs[n_loads],
+                                                                     &gate_inners[n_loads],
+                                                                     &up_inners[n_loads],
+                                                                     &down_inners[n_loads], 0);
+                if (load_timing) {
+                    ds4_gpu_stream_expert_timing_note_prepare_buffer(
+                            ds4_gpu_now_ms() - buffer_t0);
+                }
+                if (!prepared) {
+                    ok = 0;
+                    break;
+                }
             }
             if (!force_reuse && reserved_entries < UINT32_MAX) {
                 reserved_entries++;

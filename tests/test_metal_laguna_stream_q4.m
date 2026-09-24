@@ -379,6 +379,108 @@ static void check_legacy_selection_limit(void) {
     puts("laguna-stream-legacy-limit: OK (9/10 remain unsupported)");
 }
 
+/* Batch consumer (block prefill) at a full cache: four overlapping rows give a
+ * union of 25 misses. Victims must be taken in blocks of ten (three scans, no
+ * per-miss preparation) and must be exactly the 25 entries with the lowest
+ * hotness and last_used, i.e. the ones the miss-by-miss choice would have
+ * evicted. */
+static int check_batch_victims(laguna_stream_fixture *f, uint64_t bytes) {
+    enum { ROWS = 4, STEP = 5, UNION = (ROWS - 1) * STEP + 10, LAYER = 15 };
+    static bool victim[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER]
+                      [DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    memset(victim, 0, sizeof(victim));
+    for (unsigned k = 0; k < UNION; k++) {
+        unsigned best_layer = UINT32_MAX, best_expert = UINT32_MAX;
+        for (unsigned il = 0; il < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; il++)
+            for (unsigned e = 0; e < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; e++) {
+                if (!g_stream_expert_cache[il][e].valid || victim[il][e]) continue;
+                if (best_layer == UINT32_MAX) { best_layer = il; best_expert = e; continue; }
+                const uint32_t h = g_stream_expert_cache_route_hotness[il][e];
+                const uint32_t bh = g_stream_expert_cache_route_hotness[best_layer][best_expert];
+                if (h < bh || (h == bh && g_stream_expert_cache[il][e].last_used <
+                                          g_stream_expert_cache[best_layer][best_expert].last_used)) {
+                    best_layer = il; best_expert = e;
+                }
+            }
+        assert(best_layer != UINT32_MAX && best_layer != LAYER);
+        victim[best_layer][best_expert] = true;
+    }
+
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(ROWS * FIX_DIM * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(ROWS * 10 * FIX_DIM * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(ROWS * FIX_DIM * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(ROWS * 10 * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(ROWS * 10 * sizeof(float));
+    assert(out && mid && x && selected && weights);
+    static float input[ROWS * FIX_DIM], actual_mid[ROWS * 10 * FIX_DIM];
+    float ws[ROWS * 10];
+    int32_t ids[ROWS * 10];
+    for (unsigned i = 0; i < ROWS * FIX_DIM; i++) input[i] = 1.0f / FIX_DIM;
+    for (unsigned r = 0; r < ROWS; r++)
+        for (unsigned i = 0; i < 10; i++) {
+            ids[r * 10 + i] = (int32_t)(r * STEP + i);
+            ws[r * 10 + i] = 0.1f;
+        }
+    assert(ds4_gpu_tensor_write(x, 0, input, sizeof(input)));
+    assert(ds4_gpu_tensor_write(selected, 0, ids, sizeof(ids)));
+    assert(ds4_gpu_tensor_write(weights, 0, ws, sizeof(ws)));
+
+    const uint64_t hits = g_stream_expert_cache_hits;
+    const uint64_t misses = g_stream_expert_cache_misses;
+    const uint64_t evictions = g_stream_expert_cache_evictions;
+    const uint64_t reads = g_stream_expert_cache_pread_bytes;
+    const uint64_t scans = g_stream_expert_timing_reuse_scan_calls;
+    const uint64_t batches = g_stream_expert_timing_prepare_batch_reuse_calls;
+    const uint64_t buffers = g_stream_expert_timing_prepare_buffer_calls;
+    const uint64_t allocs = g_stream_expert_cache_buffer_allocs;
+    assert(ds4_gpu_laguna_routed_moe_batch_tensor(
+        out, mid, f->map, f->size,
+        f->desc.gate_offset, f->desc.up_offset, f->desc.down_offset,
+        f->desc.gate_type, f->desc.up_type, f->desc.down_type,
+        f->desc.gate_expert_bytes, f->desc.gate_row_bytes,
+        f->desc.up_expert_bytes, f->desc.up_row_bytes,
+        f->desc.down_expert_bytes, f->desc.down_row_bytes,
+        FIX_DIM, FIX_DIM, FIX_DIM, selected, weights, FIX_TOTAL, 10, LAYER,
+        x, ROWS, 10 * FIX_DIM, false));
+    assert(ds4_gpu_synchronize());
+
+    assert(g_stream_expert_cache_misses - misses == UNION);
+    assert(g_stream_expert_cache_hits - hits == ROWS * 10 - UNION);
+    assert(g_stream_expert_cache_evictions - evictions == UNION);
+    assert(g_stream_expert_cache_pread_bytes - reads == UNION * bytes);
+    assert(g_stream_expert_timing_reuse_scan_calls - scans == (UNION + 9) / 10);
+    assert(g_stream_expert_timing_prepare_batch_reuse_calls - batches == (UNION + 9) / 10);
+    assert(g_stream_expert_timing_prepare_buffer_calls == buffers);
+    assert(g_stream_expert_cache_buffer_allocs == allocs);
+    assert(ds4_gpu_stream_expert_cache_current_count() == 1618);
+    for (unsigned il = 0; il < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; il++)
+        for (unsigned e = 0; e < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; e++) {
+            if (il == LAYER) {
+                assert((g_stream_expert_cache[il][e].valid != 0) == (e < UNION));
+            } else if (victim[il][e]) {
+                assert(!g_stream_expert_cache[il][e].valid);
+            }
+        }
+
+    /* The reused buffers must hold the right bytes: every row against the
+     * oracle. */
+    assert(ds4_gpu_tensor_read(mid, 0, actual_mid, sizeof(actual_mid)));
+    for (unsigned r = 0; r < ROWS; r++) {
+        double expected[FIX_DIM], expected_mid[10 * FIX_DIM];
+        fixture_reference(f, ids + r * 10, ws + r * 10, input + r * FIX_DIM,
+                          expected, expected_mid);
+        for (unsigned i = 0; i < 10 * FIX_DIM; i++) {
+            const float a = actual_mid[r * 10 * FIX_DIM + i];
+            assert(isfinite(a) &&
+                   fabs(a - expected_mid[i]) < 1e-7 + 1e-4 * fabs(expected_mid[i]));
+        }
+    }
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(weights);
+    puts("laguna-stream-batch-victims: OK (25-miss union, 3 scans, same victims)");
+    return 1;
+}
+
 static int check_saturation(bool slabs) {
     @autoreleasepool {
         /* Same slot count as the real 8 GiB cache; payload 48 times smaller. */
@@ -474,6 +576,7 @@ static int check_saturation(bool slabs) {
         assert(g_laguna_stream_moe_calls == calls && g_laguna_stream_token_rows == 26);
         assert(!g_stream_expert_cache_decode_tokens && !g_laguna_stream_failures);
         assert(g_test_model_range_calls == views);
+        assert(check_batch_victims(&f, bytes));
         ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(weights);
         ds4_gpu_cleanup(); assert_cache_drained(); fixture_close(&f);
