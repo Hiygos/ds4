@@ -109,7 +109,7 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
     return n;
 }
 
-#ifndef DS4_NO_GPU
+#if !defined(DS4_NO_GPU) || defined(DS4_TEST_HOOKS)
 #include "ds4_gpu.h"
 #endif
 
@@ -4722,7 +4722,7 @@ static uint32_t ds4_streaming_cache_experts_for_byte_budget(
     return ds4_ssd_cache_experts_for_byte_budget(bytes, per_expert_bytes);
 }
 
-#ifndef DS4_NO_GPU
+#if !defined(DS4_NO_GPU) || defined(DS4_TEST_HOOKS)
 static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
         const ds4_model         *model,
         const ds4_layer_weights *layer,
@@ -6764,6 +6764,198 @@ static bool model_map_span_vec_finish(ds4_model_map_span_vec *spans) {
     }
     spans->len = out;
     return spans->len != 0;
+}
+
+/* Host-only preparation; no cache state or model views are installed here. */
+static bool laguna_stream_tensor_valid(const ds4_model *m, const ds4_tensor *t) {
+    if (!m || !t || t->ndim == 0 || t->ndim > DS4_MAX_DIMS ||
+        t->abs_offset < m->tensor_data_pos || t->abs_offset > m->size ||
+        t->bytes == 0 || t->bytes > m->size - t->abs_offset) return false;
+    const gguf_type_info *info = tensor_type(t->type);
+    if (!info || !info->block_elems || !info->block_bytes ||
+        t->dim[0] % info->block_elems) return false;
+    uint64_t elements = 1;
+    for (uint32_t i = 0; i < t->ndim; i++) {
+        if (!t->dim[i] || elements > UINT64_MAX / t->dim[i]) return false;
+        elements *= t->dim[i];
+    }
+    const uint64_t blocks = elements / info->block_elems;
+    return blocks <= UINT64_MAX / info->block_bytes &&
+           t->elements == elements && t->bytes == blocks * info->block_bytes;
+}
+
+static bool laguna_stream_tensor_matches(
+        const ds4_model *m, const ds4_tensor *t, uint32_t type,
+        uint32_t ndim, uint64_t d0, uint64_t d1, uint64_t d2) {
+    if (!t || t->type != type || t->ndim != ndim || t->dim[0] != d0 ||
+        (ndim > 1 && t->dim[1] != d1) || (ndim > 2 && t->dim[2] != d2) ||
+        !laguna_stream_tensor_valid(m, t)) return false;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        if (t == &m->tensors[i]) return true;
+    }
+    return false;
+}
+
+static bool laguna_stream_is_routed(const ds4_weights *w, const ds4_tensor *t) {
+    for (uint32_t il = 1; il < 48; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (t == l->ffn_gate_exps || t == l->ffn_up_exps || t == l->ffn_down_exps)
+            return true;
+    }
+    return false;
+}
+
+static DS4_MAYBE_UNUSED bool laguna_stream_layout_supported(
+        const ds4_model *m, const ds4_weights *w) {
+    if (!m || !w || !m->map || !m->tensors || !m->n_tensors ||
+        m->n_tensors > UINT32_MAX ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA ||
+        DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_S21 ||
+        DS4_N_LAYER != 48 || DS4_N_LEADING_DENSE != 1 ||
+        DS4_N_EMBD != 3072 || DS4_N_VOCAB != 100352 ||
+        DS4_N_EXPERT != 256 || DS4_N_EXPERT_USED != 10 ||
+        DS4_N_FF_EXP != 1024 || DS4_N_FF_SHARED != 1024 ||
+        DS4_N_EXPERT_SHARED != 1 || DS4_N_FF_DENSE != 12288 ||
+        DS4_N_HEAD != 72 || DS4_N_HEAD_KV != 8 ||
+        DS4_N_HEAD_DIM != 128 || DS4_N_VALUE_DIM != 128) return false;
+
+#define LAGUNA_MATCH(t_, type_, nd_, d0_, d1_, d2_) \
+    do { if (!laguna_stream_tensor_matches(m, (t_), (type_), (nd_), \
+                                           (d0_), (d1_), (d2_))) return false; } while (0)
+    LAGUNA_MATCH(w->token_embd, DS4_TENSOR_Q8_0, 2, 3072, 100352, 0);
+    LAGUNA_MATCH(w->output, DS4_TENSOR_Q8_0, 2, 3072, 100352, 0);
+    LAGUNA_MATCH(w->output_norm, DS4_TENSOR_F32, 1, 3072, 0, 0);
+    for (uint32_t il = 0; il < 48; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        const uint32_t heads = g_ds4_head_counts[il];
+        if (heads != ((il % 4u) == 0 ? 48u : 72u)) return false;
+        const uint64_t qdim = (uint64_t)heads * 128;
+        LAGUNA_MATCH(l->attn_norm, DS4_TENSOR_F32, 1, 3072, 0, 0);
+        LAGUNA_MATCH(l->attn_q, DS4_TENSOR_Q8_0, 2, 3072, qdim, 0);
+        LAGUNA_MATCH(l->attn_k, DS4_TENSOR_Q8_0, 2, 3072, 1024, 0);
+        LAGUNA_MATCH(l->attn_v, DS4_TENSOR_Q8_0, 2, 3072, 1024, 0);
+        LAGUNA_MATCH(l->attn_gate, DS4_TENSOR_Q8_0, 2, 3072, heads, 0);
+        LAGUNA_MATCH(l->attn_q_norm, DS4_TENSOR_F32, 1, 128, 0, 0);
+        LAGUNA_MATCH(l->attn_k_norm, DS4_TENSOR_F32, 1, 128, 0, 0);
+        LAGUNA_MATCH(l->attn_output, DS4_TENSOR_Q8_0, 2, qdim, 3072, 0);
+        LAGUNA_MATCH(l->ffn_norm, DS4_TENSOR_F32, 1, 3072, 0, 0);
+        if (il == 0) {
+            if (l->ffn_gate_exps || l->ffn_up_exps || l->ffn_down_exps ||
+                l->ffn_gate_shexp || l->ffn_up_shexp || l->ffn_down_shexp ||
+                l->ffn_gate_inp || l->ffn_exp_probs_b) return false;
+            LAGUNA_MATCH(l->ffn_gate, DS4_TENSOR_Q8_0, 2, 3072, 12288, 0);
+            LAGUNA_MATCH(l->ffn_up, DS4_TENSOR_Q8_0, 2, 3072, 12288, 0);
+            LAGUNA_MATCH(l->ffn_down, DS4_TENSOR_Q8_0, 2, 12288, 3072, 0);
+        } else {
+            if (l->ffn_gate || l->ffn_up || l->ffn_down) return false;
+            LAGUNA_MATCH(l->ffn_gate_inp, DS4_TENSOR_F32, 2, 3072, 256, 0);
+            LAGUNA_MATCH(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, 256, 0, 0);
+            LAGUNA_MATCH(l->ffn_gate_exps, DS4_TENSOR_Q4_K, 3, 3072, 1024, 256);
+            LAGUNA_MATCH(l->ffn_up_exps, DS4_TENSOR_Q4_K, 3, 3072, 1024, 256);
+            LAGUNA_MATCH(l->ffn_down_exps, DS4_TENSOR_Q4_K, 3, 1024, 3072, 256);
+            LAGUNA_MATCH(l->ffn_gate_shexp, DS4_TENSOR_Q8_0, 2, 3072, 1024, 0);
+            LAGUNA_MATCH(l->ffn_up_shexp, DS4_TENSOR_Q8_0, 2, 3072, 1024, 0);
+            LAGUNA_MATCH(l->ffn_down_shexp, DS4_TENSOR_Q8_0, 2, 1024, 3072, 0);
+        }
+    }
+#undef LAGUNA_MATCH
+
+    /* Reject aliases and malformed ranges before any span can include them. */
+    ds4_model_map_span_vec ranges = {0};
+    bool ok = true;
+    uint32_t routed_count = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (!laguna_stream_tensor_valid(m, t) ||
+            (t->ndim == 3 && !laguna_stream_is_routed(w, t))) {
+            ok = false;
+            break;
+        }
+        if (laguna_stream_is_routed(w, t)) routed_count++;
+        model_map_span_vec_append(&ranges, t->abs_offset, t->abs_offset + t->bytes, false);
+    }
+    if (routed_count != 47u * 3u) ok = false;
+    if (ok) {
+        qsort(ranges.v, ranges.len, sizeof(ranges.v[0]), model_map_span_cmp);
+        for (uint32_t i = 1; i < ranges.len; i++) {
+            if (ranges.v[i].off < ranges.v[i - 1].end) { ok = false; break; }
+        }
+    }
+    free(ranges.v);
+    return ok;
+}
+
+#if !defined(DS4_NO_GPU) || defined(DS4_TEST_HOOKS)
+static DS4_MAYBE_UNUSED bool laguna_stream_expert_tables_make(
+        const ds4_model *m, const ds4_weights *w,
+        ds4_gpu_stream_expert_table tables[48], uint64_t *entry_bytes) {
+    if (!tables || !entry_bytes) return false;
+    memset(tables, 0, 48 * sizeof(*tables));
+    *entry_bytes = 0;
+    if (!laguna_stream_layout_supported(m, w)) return false;
+    for (uint32_t il = 1; il < 48; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        uint64_t gate = 0, down = 0;
+        if (!streaming_layer_gate_down_expert_bytes(l, &gate, &down) ||
+            gate > (UINT64_MAX - down) / 2) return false;
+        tables[il] = graph_stream_expert_table_make(m, l, il, gate, down);
+        *entry_bytes = 2 * gate + down;
+    }
+    return true;
+}
+#endif
+
+static DS4_MAYBE_UNUSED bool laguna_stream_model_spans(
+        const ds4_model *m, const ds4_weights *w, ds4_model_map_span_vec *spans,
+        uint64_t *non_routed_bytes, uint64_t *routed_bytes) {
+    if (!spans || !non_routed_bytes || !routed_bytes) return false;
+    memset(spans, 0, sizeof(*spans));
+    *non_routed_bytes = *routed_bytes = 0;
+    if (!laguna_stream_layout_supported(m, w)) return false;
+    /* Walk the tensor directory so even additional non-routed tensors are covered. */
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (laguna_stream_is_routed(w, t)) {
+            *routed_bytes += t->bytes;
+        } else {
+            *non_routed_bytes += t->bytes;
+            model_map_span_vec_include_one(spans, t);
+        }
+    }
+    return model_map_span_vec_finish(spans);
+}
+
+typedef struct {
+    uint32_t experts;
+    uint64_t expert_bytes;
+    uint64_t budget_bytes;
+    uint64_t payload_bytes;
+} laguna_stream_cache_config;
+
+/* available_bytes is a caller-computed payload cap after KV/scratch/reserve. */
+static DS4_MAYBE_UNUSED bool laguna_stream_configure_cache(
+        uint64_t entry_bytes, uint32_t requested_experts, uint64_t requested_bytes,
+        uint64_t available_bytes, laguna_stream_cache_config *config) {
+    if (!config) return false;
+    memset(config, 0, sizeof(*config));
+    if (!entry_bytes || (requested_experts && requested_bytes)) return false;
+    const uint32_t max_experts = 47u * 256u;
+    uint64_t budget = requested_bytes;
+    if (requested_experts) {
+        if (requested_experts > max_experts || entry_bytes > UINT64_MAX / requested_experts)
+            return false;
+        budget = entry_bytes * requested_experts;
+    } else if (!budget) {
+        budget = 8ull * 1024 * 1024 * 1024;
+        if (available_bytes < budget) budget = available_bytes;
+    }
+    if (budget > available_bytes) return false;
+    const uint64_t count = budget / entry_bytes;
+    const uint32_t experts = count > max_experts ? max_experts :
+        ds4_ssd_cache_experts_for_byte_budget(budget, entry_bytes);
+    if (experts < 10) return false;
+    *config = (laguna_stream_cache_config){experts, entry_bytes, budget, experts * entry_bytes};
+    return true;
 }
 
 static DS4_MAYBE_UNUSED bool weights_model_map_spans(

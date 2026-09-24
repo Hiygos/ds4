@@ -9,16 +9,16 @@ static int consume(laguna_stream_fixture *f, ds4_gpu_tensor *out,
                    ds4_gpu_tensor *weights, ds4_gpu_tensor *x, uint32_t layer) {
     const uint64_t views = g_test_model_range_calls;
     const int ok = ds4_gpu_laguna_stream_routed_moe_one_tensor(
-        out, mid, f->map, f->size, &f->desc, FIX_DIM, FIX_DIM, FIX_DIM,
+        out, mid, f->map, f->size, &f->desc, f->in_dim, f->mid_dim, f->out_dim,
         selected, weights, FIX_TOTAL, DS4_STREAM_Q4_MAX_SELECTED, layer, x);
     assert(g_test_model_range_calls == views);
     assert(!g_stream_expert_pending_load.active);
     return ok;
 }
 
-int main(void) {
+static int run_case(bool rectangular) {
     @autoreleasepool {
-        laguna_stream_fixture f = fixture_open();
+        laguna_stream_fixture f = fixture_open_case(rectangular);
         if (!ds4_gpu_init()) {
             fprintf(stderr, "Metal unavailable: this fixture needs a Metal device\n");
             fixture_close(&f);
@@ -28,15 +28,18 @@ int main(void) {
         assert(ds4_gpu_set_model_fd(fileno(f.file)));
         const uint64_t offset = 0, size = FIX_PREFIX;
         assert(ds4_gpu_set_model_map_spans(f.map, f.size, &offset, &size, 1, FIX_PREFIX));
-        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(FIX_DIM * sizeof(float));
-        ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(10 * FIX_DIM * sizeof(float));
-        ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(FIX_DIM * sizeof(float));
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(f.out_dim * sizeof(float));
+        ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(10 * f.mid_dim * sizeof(float));
+        ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(f.in_dim * sizeof(float));
         ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(10 * sizeof(int32_t));
         ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(10 * sizeof(float));
         ds4_gpu_tensor *logits = ds4_gpu_tensor_alloc(FIX_TOTAL * sizeof(float));
         ds4_gpu_tensor *probs = ds4_gpu_tensor_alloc(FIX_TOTAL * sizeof(float));
         assert(out && mid && x && selected && weights && logits && probs);
-        assert(ds4_gpu_tensor_fill_f32(x, 1.0f / FIX_DIM, FIX_DIM));
+        float input[512];
+        for (unsigned c = 0; c < f.in_dim; c++)
+            input[c] = rectangular ? (1.0f + c % 17) / (9 * f.in_dim) : 1.0f / f.in_dim;
+        assert(ds4_gpu_tensor_write(x, 0, input, f.in_dim * sizeof(float)));
 
         ds4_gpu_set_streaming_expert_cache_budget(9);
         assert(!consume(&f, out, mid, selected, weights, x, 1));
@@ -64,25 +67,30 @@ int main(void) {
             assert(g_stream_expert_cache_hits - hits == expected_hits);
             assert(g_stream_expert_cache_misses - misses == 10 - expected_hits);
             assert(g_stream_expert_cache_pread_bytes - reads ==
-                   (10 - expected_hits) * 3 * f.desc.gate_expert_bytes);
+                   (10 - expected_hits) * (2 * f.desc.gate_expert_bytes + f.desc.down_expert_bytes));
             assert(ds4_gpu_stream_expert_cache_current_count() == 10);
             assert(ds4_gpu_end_commands());
 
             int32_t ids[10];
-            float ws[10], actual[FIX_DIM];
+            float ws[10], actual[512];
             assert(ds4_gpu_tensor_read(selected, 0, ids, sizeof(ids)));
             assert(ds4_gpu_tensor_read(weights, 0, ws, sizeof(ws)));
-            assert(ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)));
-            double expected = 0;
+            assert(ds4_gpu_tensor_read(out, 0, actual, f.out_dim * sizeof(float)));
+            double expected[512];
+            double expected_mid[10 * FIX_DIM];
+            float actual_mid[10 * FIX_DIM];
+            fixture_reference(&f, ids, ws, input, expected, expected_mid);
+            assert(ds4_gpu_tensor_read(mid, 0, actual_mid, sizeof(actual_mid)));
+            for (unsigned i = 0; i < 10 * f.mid_dim; i++) {
+                assert(isfinite(actual_mid[i]) &&
+                       fabs(actual_mid[i] - expected_mid[i]) < 1e-7 + 1e-4 * fabs(expected_mid[i]));
+            }
             unsigned seen = 0;
             for (unsigned slot = 0; slot < 10; slot++) {
                 assert(ids[slot] >= (int32_t)first && ids[slot] < (int32_t)(first + 10));
                 const unsigned expert = (unsigned)ids[slot];
                 assert(!(seen & (1u << expert)));
                 seen |= 1u << expert;
-                const double gate = fixture_quant(0, expert) / 16.0;
-                const double up = fixture_quant(1, expert) / 16.0;
-                expected += gate / (1.0 + exp(-gate)) * up * ws[slot] * fixture_quant(2, expert);
                 ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
                 assert(e->valid && !ds4_gpu_stream_expert_cache_entry_inflight(e));
                 assert(e->gate_abs_offset == f.desc.gate_offset + expert * f.desc.gate_expert_bytes);
@@ -96,8 +104,9 @@ int main(void) {
                               f.map + e->down_abs_offset, f.desc.down_expert_bytes) == 0);
             }
             assert((seen & (3u << 8)) == (3u << 8));
-            for (unsigned row = 0; row < FIX_DIM; row++) {
-                assert(isfinite(actual[row]) && fabs(actual[row] - expected) < 1e-4 * (1 + fabs(expected)));
+            for (unsigned row = 0; row < f.out_dim; row++) {
+                assert(isfinite(actual[row]) &&
+                       fabs(actual[row] - expected[row]) < 1e-4 * (1 + fabs(expected[row])));
             }
         }
 
@@ -124,7 +133,22 @@ int main(void) {
         ds4_gpu_tensor_free(probs);
         ds4_gpu_cleanup();
         fixture_close(&f);
-        puts("laguna-stream-q4-metal: OK (router, top-10, hit/miss, reuse, numeric, no fallback, I/O failure)");
+        printf("laguna-stream-q4-metal: OK (%s, router, top-10, hit/miss, reuse, numeric, no fallback, I/O failure)\n",
+               rectangular ? "rectangular/distinct rows" : "square");
     }
     return 0;
+}
+
+static void reset_fixture_cache_size_class(void) {
+    assert(!g_initialized);
+    assert(g_stream_expert_cache_entry_count == 0);
+    assert(!g_stream_expert_pending_load.active);
+    g_stream_expert_cache_expert_bytes = 0;
+}
+
+int main(void) {
+    if (run_case(false)) return 1;
+    /* Production keeps one model size class for the process lifetime. */
+    reset_fixture_cache_size_class();
+    return run_case(true);
 }

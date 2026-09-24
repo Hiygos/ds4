@@ -409,11 +409,19 @@ tests/test_laguna_stream_q4: tests/test_laguna_stream_q4.c tests/laguna_stream_q
 laguna-stream-q4-host-test: tests/test_laguna_stream_q4
 	./tests/test_laguna_stream_q4
 
+tests/test_laguna_stream_layout: tests/test_laguna_stream_layout.c ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_ssd.h ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -o $@ $< ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o $(LDLIBS)
+
+.PHONY: laguna-stream-layout-host-test
+laguna-stream-layout-host-test: tests/test_laguna_stream_layout
+	./tests/test_laguna_stream_layout
+
 ifeq ($(UNAME_S),Darwin)
 tests/test_metal_laguna_stream_q4: tests/test_metal_laguna_stream_q4.m tests/laguna_stream_q4_fixture.h ds4_metal.m ds4_stream_q4.h ds4_gpu.h $(METAL_SRCS) $(filter-out ds4_metal.o,$(CORE_OBJS))
 	$(CC) $(OBJCFLAGS) -I. -o $@ $< $(filter-out ds4_metal.o,$(CORE_OBJS)) $(METAL_LDLIBS)
 endif
 
 clean:
+	rm -f tests/test_laguna_stream_layout
 	rm -f tests/test_laguna_stream_q4 tests/test_metal_laguna_stream_q4
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
