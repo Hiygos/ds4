@@ -263,8 +263,10 @@ On the development Strix Halo with the official Q4_K_M GGUF, a 2,048-token
 prefill runs at about 252 tokens/s and short-context generation at about 25.8
 tokens/s; after an 8,192-token prompt prefill is about 194 tokens/s and
 generation about 24.1 tokens/s. The smaller mixed Q2_K/Q3_K quant is faster
-still. Laguna currently requires full model residency; SSD streaming,
-distributed inference, and tensor parallelism are not implemented.
+still. On ROCm and CUDA Laguna requires full model residency; SSD streaming
+is implemented only on Metal, for the official Q4_K_M GGUF (see
+[docs/LAGUNA-SSD-STREAMING.md](docs/LAGUNA-SSD-STREAMING.md)). Distributed
+inference and tensor parallelism are not implemented.
 
 DFlash speculative decoding works on ROCm. With a fixed verifier width
 (`--dflash-p-min 0`) it is token-exact against ordinary decoding in the
