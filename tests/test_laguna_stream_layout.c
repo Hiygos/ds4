@@ -232,6 +232,82 @@ static void check_cache(void) {
     assert(!laguna_stream_configure_cache(entry, 0, 0, 0, &c));
 }
 
+static void check_streaming_requests(void) {
+    ds4_engine_options opt = {.backend = DS4_BACKEND_METAL, .ssd_streaming = true};
+    const char *blocked[] = {
+        "DS4_METAL_GLM_DISABLE_STREAMING_EXPERT_CACHE",
+        "DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE",
+        "DS4_METAL_ENABLE_STREAMING_COMPACT_ADDR",
+        "DS4_METAL_GLM_STREAMING_PREFILL_FULL_LAYER",
+    };
+    char *saved[4];
+    for (unsigned i = 0; i < 4; i++) {
+        const char *value = getenv(blocked[i]);
+        saved[i] = value ? strdup(value) : NULL;
+        unsetenv(blocked[i]);
+    }
+    assert(!laguna_stream_options_error(&opt));
+#define REJECT(field_, value_) do { \
+    ds4_engine_options bad = opt; bad.field_ = (value_); \
+    assert(laguna_stream_options_error(&bad)); \
+} while (0)
+    REJECT(backend, DS4_BACKEND_CPU);
+    REJECT(backend, DS4_BACKEND_CUDA);
+    REJECT(dflash_path, "draft.gguf");
+    REJECT(dflash_draft_tokens, 1);
+    REJECT(dflash_p_min_set, true);
+    REJECT(mtp_path, "mtp.gguf");
+    REJECT(warm_weights, true);
+    REJECT(ssd_streaming_full_layers_set, true);
+    REJECT(ssd_streaming_full_layers, 1);
+    REJECT(ssd_streaming_preload_experts, 10);
+    REJECT(ssd_streaming_cold, true);
+    REJECT(metal_graph_test, true);
+#undef REJECT
+    for (unsigned i = 0; i < 4; i++) {
+        assert(setenv(blocked[i], "0", 1) == 0);
+        assert(strcmp(laguna_stream_options_error(&opt), blocked[i]) == 0);
+        unsetenv(blocked[i]);
+    }
+    for (unsigned i = 0; i < 4; i++) {
+        if (saved[i]) { setenv(blocked[i], saved[i], 1); free(saved[i]); }
+    }
+    assert(laguna_stream_request_supported(NULL, NULL, NULL));
+    /* A non-null pointer is enough to reject even a single verifier row. */
+    for (unsigned mask = 1; mask < 8; mask++)
+        assert(!laguna_stream_request_supported(mask & 1 ? &opt : NULL,
+                mask & 2 ? &opt : NULL, mask & 4 ? &opt : NULL));
+    ds4_engine engine = {.backend = DS4_BACKEND_METAL, .ssd_streaming = true};
+    ds4_session session = {.engine = &engine};
+    char err[128] = {0};
+    int accepted = -1;
+    assert(ds4_session_eval_speculative_argmax(&session, 0, 1, 2,
+            &accepted, 1, err, sizeof(err)) == -1);
+    assert(strstr(err, "does not support speculative decoding"));
+    assert(accepted == -1 && session.checkpoint.len == 0);
+}
+
+static void check_memory_admission(void) {
+    uint64_t kv, scratch;
+    assert(laguna_stream_graph_bytes(256, &kv, &scratch));
+    assert(kv == 48ull * 256 * 1024 * 2 * 2);
+    assert(scratch > 0 && scratch < 1048576);
+    assert(!laguna_stream_graph_bytes(0, &kv, &scratch));
+    assert(!laguna_stream_graph_bytes(UINT32_MAX, &kv, &scratch));
+    const uint64_t gib = 1ull << 30, entry = 5308416;
+    const uint64_t cap = laguna_stream_available_cache_bytes(48 * gib, 5 * gib, 256);
+    assert(cap > 8 * gib);
+    assert(!laguna_stream_available_cache_bytes(0, 5 * gib, 256));
+    assert(!laguna_stream_available_cache_bytes(48 * gib, UINT64_MAX, 256));
+    assert(!laguna_stream_available_cache_bytes(6 * gib, 5 * gib, 256));
+    laguna_stream_cache_config cache;
+    assert(laguna_stream_configure_cache(entry, 0, 0, cap, &cache));
+    assert(cache.experts == 1618 && cache.budget_bytes == 8 * gib);
+    assert(!laguna_stream_configure_cache(entry, 0, cap + 1, cap, &cache));
+    assert(laguna_stream_configure_cache(entry, 0, 0, 20 * entry, &cache));
+    assert(cache.experts == 20);
+}
+
 int main(int argc, char **argv) {
     ds4_model m;
     ds4_weights w;
@@ -248,7 +324,9 @@ int main(int argc, char **argv) {
     check_plan(&m, &w);
     check_rejections(&m, &w);
     check_cache();
+    check_streaming_requests();
+    check_memory_admission();
     free(m.tensors);
-    puts("laguna-stream-layout-host: OK (all layers, tables, spans, overflow, cache)");
+    puts("laguna-stream-layout-host: OK (all layers, tables, spans, overflow, cache, flags, DFlash, memory)");
     return 0;
 }

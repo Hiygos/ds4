@@ -4,6 +4,41 @@
 #include "../ds4_metal.m"
 #include "laguna_stream_q4_fixture.h"
 
+static unsigned read_calls, fail_read;
+static int read_error, truncate_read;
+
+static ssize_t fault_pread(int fd, void *dst, size_t len, off_t off) {
+    assert(g_test_laguna_stream_temporary_bytes > 0);
+    const unsigned call = __atomic_add_fetch(&read_calls, 1, __ATOMIC_RELAXED);
+    if (call == fail_read) {
+        if (truncate_read) {
+            assert(ftruncate(fd, off + (off_t)(len / 2)) == 0);
+        } else {
+            errno = read_error;
+            return -1;
+        }
+    }
+    /* A short but positive read must be completed too. */
+    if (call == 1) len /= 2;
+    return pread(fd, dst, len, off);
+}
+
+static void assert_cache_drained(void) {
+    assert(g_stream_expert_cache_entry_count == 0);
+    assert(!g_stream_expert_pending_load.active);
+    assert(!g_stream_expert_pending_load.model_map);
+    assert(!g_stream_expert_pending_load.n_tasks);
+    assert(!g_stream_expert_pread_pool_tasks);
+    assert(!g_stream_expert_pread_pool_remaining_workers);
+    for (unsigned layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        for (unsigned expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+            ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
+            assert(!e->valid && !e->model_map && !e->gate_buffer && !e->up_buffer && !e->down_buffer);
+        }
+    }
+    assert(g_test_laguna_stream_temporary_bytes == 0);
+}
+
 static int consume(laguna_stream_fixture *f, ds4_gpu_tensor *out,
                    ds4_gpu_tensor *mid, ds4_gpu_tensor *selected,
                    ds4_gpu_tensor *weights, ds4_gpu_tensor *x, uint32_t layer) {
@@ -13,12 +48,24 @@ static int consume(laguna_stream_fixture *f, ds4_gpu_tensor *out,
         selected, weights, FIX_TOTAL, DS4_STREAM_Q4_MAX_SELECTED, layer, x);
     assert(g_test_model_range_calls == views);
     assert(!g_stream_expert_pending_load.active);
+    assert(g_test_laguna_stream_temporary_bytes == 0);
+    const uint64_t bytes = 2 * f->desc.gate_expert_bytes + f->desc.down_expert_bytes;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t limit = 10 * ((bytes + page - 1) / page * page);
+    assert(g_test_laguna_stream_peak_bytes <= limit);
+    assert(g_test_laguna_stream_peak_allocated_bytes <= limit);
+    assert(g_laguna_stream_allocated_bytes <= limit);
     return ok;
 }
 
-static int run_case(bool rectangular) {
+static int run_case(bool rectangular, laguna_stream_fixture *previous) {
     @autoreleasepool {
         laguna_stream_fixture f = fixture_open_case(rectangular);
+        if (previous->file) {
+            assert(f.map != previous->map && fileno(f.file) != fileno(previous->file));
+            assert_cache_drained();
+            fixture_close(previous);
+        }
         if (!ds4_gpu_init()) {
             fprintf(stderr, "Metal unavailable: this fixture needs a Metal device\n");
             fixture_close(&f);
@@ -41,34 +88,60 @@ static int run_case(bool rectangular) {
             input[c] = rectangular ? (1.0f + c % 17) / (9 * f.in_dim) : 1.0f / f.in_dim;
         assert(ds4_gpu_tensor_write(x, 0, input, f.in_dim * sizeof(float)));
 
+        const uint64_t bytes = 2 * f.desc.gate_expert_bytes + f.desc.down_expert_bytes;
+        uint64_t slot_bytes = 0, limit = 0;
+        assert(ds4_gpu_laguna_stream_allocation_limit(bytes, 10, &slot_bytes, &limit));
+        const int slabs = ds4_gpu_stream_expert_slab_enabled();
+        uint64_t slots_per_slab = ds4_gpu_stream_expert_slab_target_bytes() / slot_bytes;
+        if (!slots_per_slab) slots_per_slab = 1;
+        const uint64_t expected_allocs = slabs ? (10 + slots_per_slab - 1) / slots_per_slab : 10;
+        g_test_laguna_stream_peak_bytes = 0;
+        g_test_laguna_stream_peak_allocated_bytes = 0;
         ds4_gpu_set_streaming_expert_cache_budget(9);
         assert(!consume(&f, out, mid, selected, weights, x, 1));
         assert(ds4_gpu_stream_expert_cache_current_count() == 0);
         ds4_gpu_set_streaming_expert_cache_budget(10);
 
-        for (unsigned pass = 0; pass < 4; pass++) {
-            const unsigned first = pass == 0 ? 0 : 2;
-            const unsigned layer = pass == 3 ? 2 : 1;
+        for (unsigned pass = 0; pass < 16; pass++) {
+            const unsigned first = pass == 0 ? 0 : pass < 4 ? 2 : pass % 3;
+            const unsigned layer = pass < 3 ? 1 : 2 + pass % 4;
             float scores[FIX_TOTAL];
             for (unsigned i = 0; i < FIX_TOTAL; i++) {
                 scores[i] = i >= first && i < first + 10 ? 0.1f * i : -10.0f;
             }
             assert(ds4_gpu_tensor_write(logits, 0, scores, sizeof(scores)));
-            /* Leave the router queued: the consumer must complete it before reading IDs. */
+            /* The consumer must complete the router before reading the IDs. */
             assert(ds4_gpu_begin_commands());
             assert(ds4_gpu_glm_router_select_tensor(
                 selected, weights, probs, f.map, f.size, 0, logits, FIX_TOTAL, 10, 1.0f));
             const uint64_t hits = g_stream_expert_cache_hits;
             const uint64_t misses = g_stream_expert_cache_misses;
             const uint64_t reads = g_stream_expert_cache_pread_bytes;
+            const uint64_t pool_tasks = g_test_laguna_stream_pool_tasks;
+            const uint64_t scans = g_stream_expert_timing_reuse_scan_calls;
+            const uint64_t batches = g_stream_expert_timing_prepare_batch_reuse_calls;
+            const uint64_t prepared = g_stream_expert_timing_prepare_task_experts;
+            const uint64_t buffers = g_stream_expert_timing_prepare_buffer_calls;
             assert(consume(&f, out, mid, selected, weights, x, layer));
             assert(g_batch_cb != nil && !g_batch_has_work);
             const unsigned expected_hits = pass == 1 ? 8 : pass == 2 ? 10 : 0;
             assert(g_stream_expert_cache_hits - hits == expected_hits);
             assert(g_stream_expert_cache_misses - misses == 10 - expected_hits);
+            /* Ten misses must hand thirty reads to the pool before the
+             * dispatch. */
+            assert(g_test_laguna_stream_pool_tasks - pool_tasks == 3 * (10 - expected_hits));
+            assert(g_stream_expert_pread_pool_thread_count > 1);
+            /* With a full cache all misses share a single victim scan. */
+            const unsigned expected_scans = pass != 0 && expected_hits != 10;
+            assert(g_stream_expert_timing_reuse_scan_calls - scans == expected_scans);
+            assert(g_stream_expert_timing_prepare_batch_reuse_calls - batches == expected_scans);
+            assert(g_stream_expert_timing_prepare_task_experts - prepared == 10 - expected_hits);
+            assert(g_stream_expert_timing_prepare_buffer_calls - buffers == (pass == 0 ? 10 : 0));
             assert(g_stream_expert_cache_pread_bytes - reads ==
                    (10 - expected_hits) * (2 * f.desc.gate_expert_bytes + f.desc.down_expert_bytes));
             assert(ds4_gpu_stream_expert_cache_current_count() == 10);
+            assert(g_stream_expert_cache_buffer_allocs == expected_allocs);
+            assert(g_stream_expert_cache_slab_count == (slabs ? expected_allocs : 0));
             assert(ds4_gpu_end_commands());
 
             int32_t ids[10];
@@ -93,6 +166,7 @@ static int run_case(bool rectangular) {
                 seen |= 1u << expert;
                 ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
                 assert(e->valid && !ds4_gpu_stream_expert_cache_entry_inflight(e));
+                assert(e->model_map == f.map && e->model_size == f.size);
                 assert(e->gate_abs_offset == f.desc.gate_offset + expert * f.desc.gate_expert_bytes);
                 assert(e->up_abs_offset == f.desc.up_offset + expert * f.desc.up_expert_bytes);
                 assert(e->down_abs_offset == f.desc.down_offset + expert * f.desc.down_expert_bytes);
@@ -109,6 +183,53 @@ static int run_case(bool rectangular) {
                        fabs(actual[row] - expected[row]) < 1e-4 * (1 + fabs(expected[row])));
             }
         }
+        if (slabs) assert(g_test_laguna_stream_peak_bytes == limit);
+        else assert(g_test_laguna_stream_peak_bytes >= 10 * bytes);
+
+        /* A GPU copy keeps the bytes of the old selection while the next one
+         * forces evictions. Try both the queued and the submitted case. */
+        id<MTLBuffer> probe = [g_device newBufferWithLength:160 options:MTLResourceStorageModeShared];
+        unsigned char expected_probe[160];
+        int32_t queued_ids[10];
+        assert(probe && ds4_gpu_tensor_read(selected, 0, queued_ids, sizeof(queued_ids)));
+        assert(ds4_gpu_begin_commands());
+        id<MTLBlitCommandEncoder> blit = [g_batch_cb blitCommandEncoder];
+        assert(blit);
+        for (unsigned i = 0; i < 10; i++) {
+            ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[5][queued_ids[i]];
+            assert(e->valid && ds4_gpu_stream_expert_cache_mark_inflight(e));
+            memcpy(expected_probe + 16 * i, (char *)[e->gate_buffer contents] + e->gate_inner, 16);
+            [blit copyFromBuffer:e->gate_buffer sourceOffset:e->gate_inner
+                       toBuffer:probe destinationOffset:16 * i size:16];
+            ds4_gpu_stream_expert_cache_clear_entry(5, queued_ids[i], 1);
+            assert(e->valid && ds4_gpu_stream_expert_cache_entry_inflight(e));
+        }
+        [blit endEncoding];
+        g_batch_has_work = 1;
+        assert(ds4_gpu_flush_commands());
+        for (unsigned i = 0; i < 10; i++) {
+            ds4_gpu_stream_expert_cache_clear_entry(5, queued_ids[i], 1);
+            assert(g_stream_expert_cache[5][queued_ids[i]].valid);
+        }
+        assert(consume(&f, out, mid, selected, weights, x, 6));
+        assert(memcmp([probe contents], expected_probe, sizeof(expected_probe)) == 0);
+        assert(g_stream_expert_cache_buffer_allocs == expected_allocs);
+        assert(ds4_gpu_end_commands());
+        blit = nil;
+        probe = nil;
+
+        /* The whole slab stays accounted even with an empty cache; no eleventh
+         * slot. */
+        ds4_gpu_stream_expert_cache_clear_all(0);
+        const uint64_t budget_errors = g_test_laguna_stream_budget_errors;
+        const uint64_t allocated_bytes = g_laguna_stream_allocated_bytes;
+        assert(!ds4_gpu_laguna_stream_alloc_buffer(slot_bytes, @"over_budget"));
+        assert(g_test_laguna_stream_budget_errors == budget_errors + 1);
+        assert(g_stream_expert_cache_buffer_allocs == expected_allocs);
+        assert_cache_drained();
+        assert(consume(&f, out, mid, selected, weights, x, 6));
+        assert(g_laguna_stream_allocated_bytes == allocated_bytes);
+        assert(g_stream_expert_cache_buffer_allocs == expected_allocs);
 
         assert(setenv("DS4_METAL_GLM_DISABLE_STREAMING_EXPERT_CACHE", "1", 1) == 0);
         assert(!consume(&f, out, mid, selected, weights, x, 1));
@@ -121,9 +242,30 @@ static int run_case(bool rectangular) {
         assert(!consume(&f, out, mid, selected, weights, x, 1));
         f.desc.down_type = DS4_METAL_TENSOR_Q4_K;
 
-        /* Fresh layer plus truncated expert payload must fail, never fall back. */
-        assert(ftruncate(fileno(f.file), FIX_PREFIX) == 0);
-        assert(!consume(&f, out, mid, selected, weights, x, 3));
+        /* Error in the parallel batch: no partially valid entry; a new
+         * selection on the same fd works. */
+        g_test_laguna_stream_pread = fault_pread;
+        for (unsigned failure = 0; failure < (rectangular ? 3u : 2u); failure++) {
+            read_calls = 0;
+            fail_read = 6;
+            read_error = failure == 0 ? EIO : EINTR;
+            truncate_read = failure == 2;
+            const uint64_t pool_tasks = g_test_laguna_stream_pool_tasks;
+            assert(!consume(&f, out, mid, selected, weights, x, 7 + failure));
+            assert(g_test_laguna_stream_pool_tasks - pool_tasks == 30);
+            assert(read_calls >= fail_read);
+            assert_cache_drained();
+            assert(g_laguna_stream_allocated_bytes == allocated_bytes);
+            assert(g_stream_expert_cache_slab_count == (slabs ? expected_allocs : 0));
+            if (slabs) assert(g_stream_expert_cache_free_slot_count == 10);
+            if (!truncate_read && (rectangular || failure == 0)) {
+                read_calls = fail_read = 0;
+                assert(consume(&f, out, mid, selected, weights, x, 7 + failure));
+                assert(read_calls == 31);
+            }
+            assert(g_stream_expert_cache_buffer_allocs == expected_allocs);
+        }
+        g_test_laguna_stream_pread = NULL;
         ds4_gpu_tensor_free(out);
         ds4_gpu_tensor_free(mid);
         ds4_gpu_tensor_free(x);
@@ -132,23 +274,136 @@ static int run_case(bool rectangular) {
         ds4_gpu_tensor_free(logits);
         ds4_gpu_tensor_free(probs);
         ds4_gpu_cleanup();
-        fixture_close(&f);
-        printf("laguna-stream-q4-metal: OK (%s, router, top-10, hit/miss, reuse, numeric, no fallback, I/O failure)\n",
-               rectangular ? "rectangular/distinct rows" : "square");
+        assert_cache_drained();
+        assert(g_model_fd == -1 && !g_model_map_ptr && g_model_view_count == 0);
+        assert(!g_stream_expert_cache_expert_bytes);
+        assert(!g_laguna_stream_buffers && !g_laguna_stream_free_buffers);
+        assert(!g_laguna_stream_allocated_bytes);
+        assert(!g_stream_expert_cache_slab_count && !g_stream_expert_cache_slab_total_slots);
+        assert(!g_stream_expert_cache_free_slot_count && !g_stream_expert_cache_slab_slot_bytes);
+        /* Keep the old file open until the new mapping is created. */
+        *previous = f;
+        printf("laguna-stream-q4-metal: OK (%s, slabs=%d, allocations=%llu, top-10, eviction, queued/inflight, budget, numeric, I/O, EINTR, cleanup)\n",
+               rectangular ? "rectangular/distinct rows" : "square", slabs,
+               (unsigned long long)expected_allocs);
     }
     return 0;
 }
 
-static void reset_fixture_cache_size_class(void) {
-    assert(!g_initialized);
-    assert(g_stream_expert_cache_entry_count == 0);
-    assert(!g_stream_expert_pending_load.active);
-    g_stream_expert_cache_expert_bytes = 0;
+/* Host limits: padding and unused slots do not vanish from the budget. */
+static void check_allocation_limits(void) {
+    const uint64_t page = (uint64_t)getpagesize();
+    uint64_t slot = 0, limit = 0;
+    assert(ds4_gpu_laguna_stream_allocation_limit(3 * page + 2, 10, &slot, &limit));
+    assert(slot == 4 * page && limit == 40 * page);
+    assert(ds4_gpu_laguna_stream_allocation_limit(5308416, 1618, &slot, &limit));
+    assert(slot == 5308416 && limit == 8589017088ull);
+    assert(!ds4_gpu_laguna_stream_allocation_limit(0, 10, &slot, &limit));
+    assert(!ds4_gpu_laguna_stream_allocation_limit(page, 0, &slot, &limit));
+    assert(!ds4_gpu_laguna_stream_allocation_limit(UINT64_MAX, 10, &slot, &limit));
+    assert(!ds4_gpu_laguna_stream_allocation_limit(UINT64_MAX / page * page, 2, &slot, &limit));
+    assert(!ds4_gpu_laguna_stream_allocation_limit(1, UINT32_MAX, &slot, &limit));
+    puts("laguna-stream-budget: OK (padding, full capacity, overflow)");
 }
 
-int main(void) {
-    if (run_case(false)) return 1;
-    /* Production keeps one model size class for the process lifetime. */
-    reset_fixture_cache_size_class();
-    return run_case(true);
+/* A requested slot must account for the whole slab, even before the pread. */
+static int check_slab_capacity(void) {
+    @autoreleasepool {
+        if (!ds4_gpu_init()) return 0;
+        ds4_gpu_set_ssd_streaming(true);
+        ds4_gpu_set_streaming_expert_cache_budget(10);
+        const uint64_t page = (uint64_t)getpagesize();
+        const uint64_t gate_bytes = page + 1, down_bytes = page;
+        assert(ds4_gpu_stream_expert_cache_note_expert_size(gate_bytes, down_bytes));
+        g_laguna_stream_cache_used = 1;
+        id<MTLBuffer> gate = nil, up = nil, down = nil;
+        NSUInteger gate_inner = 0, up_inner = 0, down_inner = 0;
+        assert(ds4_gpu_stream_expert_alloc_slab_slot(gate_bytes, down_bytes,
+            &gate, &up, &down, &gate_inner, &up_inner, &down_inner, 1));
+        assert(g_stream_expert_cache_slab_count == 1 && g_stream_expert_cache_slab_total_slots == 10);
+        assert(g_stream_expert_cache_slab_slots_used[0] == 1);
+        assert(!g_stream_expert_cache_bytes && !g_stream_expert_cache_entry_count);
+        assert(g_laguna_stream_allocated_bytes == 40 * page);
+        const uint64_t errors = g_test_laguna_stream_budget_errors;
+        assert(!ds4_gpu_laguna_stream_alloc_buffer(page, @"over_budget"));
+        assert(g_test_laguna_stream_budget_errors == errors + 1);
+        assert(g_stream_expert_cache_buffer_allocs == 1);
+        ds4_gpu_stream_expert_cache_clear_all(0);
+        assert(g_stream_expert_cache_free_slot_count == 10);
+        assert(g_laguna_stream_allocated_bytes == 40 * page);
+        assert(ds4_gpu_stream_expert_alloc_slab_slot(gate_bytes, down_bytes,
+            &gate, &up, &down, &gate_inner, &up_inner, &down_inner, 1));
+        assert(g_stream_expert_cache_buffer_allocs == 1);
+        assert(gate_inner == 9 * 4 * page && up_inner == gate_inner + gate_bytes);
+        gate = up = down = nil;
+        ds4_gpu_cleanup();
+        assert(!g_stream_expert_cache_slab_count && !g_laguna_stream_allocated_bytes);
+        puts("laguna-stream-slab: OK (unused slots, padding, allocation limit, reuse)");
+    }
+    return 1;
+}
+
+/* Exercise the same workers and fault hook without a Metal device. */
+static void check_pread_pool(void) {
+    unsigned char source[30 * 64], loaded[sizeof(source)];
+    for (unsigned i = 0; i < sizeof(source); i++) source[i] = (unsigned char)i;
+    for (unsigned failure = 0; failure < 4; failure++) {
+        FILE *file = tmpfile();
+        assert(file && fwrite(source, 1, sizeof(source), file) == sizeof(source));
+        assert(fflush(file) == 0);
+        g_model_fd = fileno(file);
+        ds4_gpu_stream_expert_pread_task tasks[30] = {0};
+        for (unsigned i = 0; i < 30; i++) {
+            tasks[i] = (ds4_gpu_stream_expert_pread_task){
+                .offset = i * 64, .len = 64, .dst = loaded + i * 64, .laguna = 1,
+            };
+        }
+        read_calls = 0;
+        fail_read = failure ? 6 : 0;
+        read_error = failure == 1 ? EIO : EINTR;
+        truncate_read = failure == 3;
+        g_test_laguna_stream_temporary_bytes = sizeof(loaded);
+        g_test_laguna_stream_pread = fault_pread;
+        const uint64_t before = g_test_laguna_stream_pool_tasks;
+        uint64_t bytes = 0;
+        double ms = 0;
+        const int ok = ds4_gpu_stream_expert_pread_tasks(tasks, 30, &bytes, &ms);
+        assert(ok == (failure == 0));
+        assert(g_test_laguna_stream_pool_tasks - before == 30);
+        assert(g_stream_expert_pread_pool_thread_count > 1);
+        assert(!g_stream_expert_pread_pool_tasks && !g_stream_expert_pread_pool_remaining_workers);
+        if (ok) {
+            assert(read_calls == 31 && bytes == sizeof(source));
+            assert(memcmp(source, loaded, sizeof(source)) == 0);
+        }
+        g_test_laguna_stream_pread = NULL;
+        g_test_laguna_stream_temporary_bytes = 0;
+        g_model_fd = -1;
+        fclose(file);
+    }
+    ds4_gpu_stream_expert_pread_pool_shutdown();
+    puts("laguna-stream-pread: OK (pool, partial reads, EIO, EINTR, EOF, drain)");
+}
+
+int main(int argc, char **argv) {
+    assert(setenv("DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY", "1", 1) == 0);
+    assert(unsetenv("DS4_METAL_DISABLE_STREAMING_EXPERT_TIMING_SUMMARY") == 0);
+    assert(setenv("DS4_METAL_STREAMING_EXPERT_PREAD_POOL", "1", 1) == 0);
+    assert(setenv("DS4_METAL_STREAMING_EXPERT_PREAD_THREADS", "9", 1) == 0);
+    check_allocation_limits();
+    check_pread_pool();
+    if (argc == 2 && strcmp(argv[1], "--pread-only") == 0) return 0;
+    assert(unsetenv("DS4_METAL_DISABLE_STREAMING_EXPERT_COMBINED_BUFFER") == 0);
+    assert(unsetenv("DS4_METAL_DISABLE_STREAMING_EXPERT_SLABS") == 0);
+    assert(setenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB", "4096", 1) == 0);
+    if (!check_slab_capacity()) return 1;
+    laguna_stream_fixture previous = {0};
+    for (unsigned mode = 0; mode < 3; mode++) {
+        if (mode == 2) assert(setenv("DS4_METAL_DISABLE_STREAMING_EXPERT_SLABS", "1", 1) == 0);
+        else assert(unsetenv("DS4_METAL_DISABLE_STREAMING_EXPERT_SLABS") == 0);
+        assert(setenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB", mode == 1 ? "1" : "4096", 1) == 0);
+        if (run_case(false, &previous) || run_case(true, &previous)) return 1;
+    }
+    fixture_close(&previous);
+    return 0;
 }

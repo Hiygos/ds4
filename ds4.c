@@ -6932,6 +6932,41 @@ typedef struct {
     uint64_t payload_bytes;
 } laguna_stream_cache_config;
 
+static DS4_MAYBE_UNUSED const char *laguna_stream_options_error(
+        const ds4_engine_options *opt) {
+    if (opt->backend != DS4_BACKEND_METAL) return "requires the Metal backend";
+    if ((opt->dflash_path && opt->dflash_path[0]) ||
+        opt->dflash_draft_tokens || opt->dflash_p_min_set)
+        return "does not support DFlash or speculative verification";
+    if (opt->mtp_path && opt->mtp_path[0])
+        return "does not support MTP support models";
+    if (opt->warm_weights) return "does not support --warm-weights";
+    if (opt->ssd_streaming_full_layers_set || opt->ssd_streaming_full_layers ||
+        opt->ssd_streaming_preload_experts || opt->ssd_streaming_cold)
+        return "does not support full layers, preload, or cold streaming";
+    if (opt->metal_graph_test)
+        return "does not support the standalone graph diagnostic";
+    const char *blocked[] = {
+        "DS4_METAL_GLM_DISABLE_STREAMING_EXPERT_CACHE",
+        "DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE",
+        "DS4_METAL_ENABLE_STREAMING_COMPACT_ADDR",
+        "DS4_METAL_GLM_STREAMING_PREFILL_FULL_LAYER",
+    };
+    for (size_t i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
+        if (getenv(blocked[i]) != NULL) return blocked[i];
+    }
+    return NULL;
+}
+
+static DS4_MAYBE_UNUSED bool laguna_stream_request_supported(
+        const void *gpu_draft_tokens, const void *row_argmax_out,
+        const void *capture) {
+    if (!gpu_draft_tokens && !row_argmax_out && !capture) return true;
+    fprintf(stderr, "ds4: Laguna SSD streaming does not support DFlash, "
+                    "speculative rows, or feature capture\n");
+    return false;
+}
+
 /* available_bytes is a caller-computed payload cap after KV/scratch/reserve. */
 static DS4_MAYBE_UNUSED bool laguna_stream_configure_cache(
         uint64_t entry_bytes, uint32_t requested_experts, uint64_t requested_bytes,
@@ -6956,6 +6991,41 @@ static DS4_MAYBE_UNUSED bool laguna_stream_configure_cache(
     if (experts < 10) return false;
     *config = (laguna_stream_cache_config){experts, entry_bytes, budget, experts * entry_bytes};
     return true;
+}
+
+/* One-row scratch mirrors laguna_graph_alloc; KV still spans the context. */
+static DS4_MAYBE_UNUSED bool laguna_stream_graph_bytes(
+        uint32_t ctx, uint64_t *kv, uint64_t *scratch) {
+    if (!ctx || ctx > DS4_CONTEXT_LENGTH) return false;
+    const uint64_t embd = DS4_N_EMBD;
+    const uint64_t q = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t v = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t routed = (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
+    const uint64_t ffn = DS4_N_FF_DENSE > routed ? DS4_N_FF_DENSE : routed;
+    *scratch = sizeof(float) * (9 * embd + 2 * q + 2 * v +
+            DS4_N_HEAD + 3 * ffn + routed + 2 * DS4_N_EXPERT +
+            DS4_N_EXPERT_USED + 1 + DS4_N_VOCAB) +
+            sizeof(uint32_t) * (2 + DS4_N_EXPERT_USED) +
+            2 * v * sizeof(uint16_t);
+    *kv = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        uint32_t cap = ds4_laguna_layer_is_swa(il) ? DS4_N_SWA : ctx;
+        if (cap > ctx) cap = ctx;
+        *kv += 2 * (uint64_t)cap * v * sizeof(uint16_t);
+    }
+    return true;
+}
+
+static DS4_MAYBE_UNUSED uint64_t laguna_stream_available_cache_bytes(
+        uint64_t recommended, uint64_t spans, uint32_t ctx) {
+    uint64_t kv = 0, scratch = 0;
+    if (!recommended || !laguna_stream_graph_bytes(ctx, &kv, &scratch)) return 0;
+    const uint64_t limit = recommended / 5 * 4;
+    const uint64_t reserve = 1ull << 30;
+    if (spans >= limit || kv >= limit - spans ||
+        scratch >= limit - spans - kv ||
+        reserve >= limit - spans - kv - scratch) return 0;
+    return limit - spans - kv - scratch - reserve;
 }
 
 static DS4_MAYBE_UNUSED bool weights_model_map_spans(
@@ -35841,6 +35911,15 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
             return m;
         }
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+            if (ssd_streaming) {
+                if (!laguna_stream_graph_bytes(ctx, &m.raw_bytes, &m.scratch_bytes))
+                    return m;
+                m.prefill_cap = 1;
+                m.raw_cap = ctx;
+                m.comp_cap = ctx < DS4_N_SWA ? ctx : DS4_N_SWA;
+                m.total_bytes = m.raw_bytes + m.scratch_bytes;
+                return m;
+            }
             const uint64_t kv_row_bytes =
                 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
             m.prefill_cap = 1;
@@ -47948,6 +48027,7 @@ typedef struct {
     ds4_gpu_tensor *key_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *value_cache[DS4_MAX_LAYER];
     uint32_t cache_cap[DS4_MAX_LAYER];
+    bool ssd_streaming;
 } ds4_laguna_gpu_graph;
 
 static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
@@ -48002,7 +48082,8 @@ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
     memset(g, 0, sizeof(*g));
 }
 
-static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size,
+                               bool ssd_streaming) {
     if (!g || ctx_size == 0 || ctx_size > DS4_CONTEXT_LENGTH ||
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) {
         return false;
@@ -48010,6 +48091,8 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
     memset(g, 0, sizeof(*g));
     g->ctx_size = ctx_size;
     g->prefill_cap = ctx_size < 16384u ? ctx_size : 16384u;
+    g->ssd_streaming = ssd_streaming;
+    if (ssd_streaming) g->prefill_cap = 1;
 
     const uint64_t f32 = sizeof(float);
     const uint64_t rows = g->prefill_cap;
@@ -48084,6 +48167,15 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
         g->kv_bytes += 2u * bytes;
     }
 
+    if (ssd_streaming) {
+        uint64_t kv = 0, scratch = 0;
+        if (!laguna_stream_graph_bytes(ctx_size, &kv, &scratch) ||
+            kv != g->kv_bytes || scratch != g->scratch_bytes) {
+            fprintf(stderr, "ds4: Laguna streaming graph memory estimate mismatch\n");
+            goto fail;
+        }
+    }
+
     fprintf(stderr,
             "ds4: Laguna GPU graph: ctx=%u, prefill=%u, KV %.2f GiB, scratch %.2f MiB\n",
             ctx_size,
@@ -48100,6 +48192,10 @@ fail:
 
 static bool laguna_graph_ensure_spec_scratch(ds4_laguna_gpu_graph *g) {
     if (!g) return false;
+    if (g->ssd_streaming) {
+        fprintf(stderr, "ds4: Laguna SSD streaming rejects speculative scratch\n");
+        return false;
+    }
     const uint64_t rows = DS4_DFLASH_BLOCK_SIZE;
     if (!g->spec_output_norm) {
         g->spec_output_norm = ds4_gpu_tensor_alloc(
@@ -48388,6 +48484,10 @@ static bool laguna_graph_routed_moe_decode_rows(
         uint64_t                down_expert_bytes,
         uint64_t                down_row_bytes) {
     if (!g || !model || !l || n_rows == 0u) return false;
+    if (g->ssd_streaming) {
+        fprintf(stderr, "ds4: Laguna SSD streaming rejects exact routed rows\n");
+        return false;
+    }
     const uint64_t embd_bytes =
         (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint64_t mid_elems =
@@ -49254,6 +49354,9 @@ static bool laguna_graph_forward_token(
         return false;
     }
 
+    if (g->ssd_streaming &&
+        !laguna_stream_request_supported(NULL, NULL, capture)) return false;
+
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = ds4_gpu_embed_token_quant_tensor(g->cur,
@@ -49569,6 +49672,18 @@ static bool laguna_graph_forward_token(
                         g->shared_weight,
                         g->ffn_norm) != 0;
             } else if (ok) {
+                if (g->ssd_streaming) {
+#if defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NATIVE_CUDA_BUILD)
+                    ok = ds4_gpu_laguna_stream_routed_moe_one_tensor(
+                            g->ffn_out, g->routed_mid, model->map, model->size,
+                            &routed_moe, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
+                            g->router_selected, g->router_weights,
+                            DS4_N_EXPERT, DS4_N_EXPERT_USED, il, g->ffn_norm) != 0;
+#else
+                    fprintf(stderr, "ds4: Laguna SSD streaming requires Metal\n");
+                    ok = false;
+#endif
+                } else {
                 ok = ds4_gpu_glm_routed_moe_one_tensor(
                         g->ffn_out,
                         g->routed_mid,
@@ -49596,6 +49711,7 @@ static bool laguna_graph_forward_token(
                         il,
                         g->ffn_norm,
                         true) != 0;
+                }
                 if (ok) {
                     ok = ds4_gpu_shared_mid_swiglu_q8_0_tensor(
                             g->ffn_mid,
@@ -49784,9 +49900,26 @@ static bool laguna_graph_forward_batch(
         void                 *display_progress_ud,
         int                   display_total) {
     if (!g || !model || !weights || !tokens || n_tokens == 0 ||
-        n_tokens > g->prefill_cap || pos0 > g->ctx_size - n_tokens) {
+        n_tokens > g->ctx_size || pos0 > g->ctx_size - n_tokens) {
         return false;
     }
+    if (g->ssd_streaming) {
+        if (!laguna_stream_request_supported(gpu_draft_tokens, row_argmax_out,
+                                              capture)) return false;
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            if (tokens[i] < 0 || tokens[i] >= (int)DS4_N_VOCAB) return false;
+        }
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            if (!laguna_graph_forward_token(g, model, weights, tokens[i],
+                    pos0 + i, NULL, i + 1u == n_tokens ? logits_out : NULL))
+                return false;
+            laguna_graph_report_prefill_display_progress(
+                    display_progress, display_progress_ud, pos0 + i, 1,
+                    DS4_N_LAYER, display_total, true);
+        }
+        return true;
+    }
+    if (n_tokens > g->prefill_cap) return false;
     if (row_argmax_out &&
         (n_tokens > DS4_DFLASH_BLOCK_SIZE ||
          !laguna_graph_ensure_spec_scratch(g))) {
@@ -50417,6 +50550,7 @@ static int generate_laguna_metal_argmax(
         const token_vec   *prompt,
         int                n_predict,
         int                ctx_size,
+        bool               ssd_streaming,
         ds4_token_emit_fn  emit,
         ds4_generation_done_fn done,
         void              *emit_ud,
@@ -50427,7 +50561,7 @@ static int generate_laguna_metal_argmax(
         return 1;
     }
     ds4_laguna_gpu_graph g;
-    if (!laguna_graph_alloc(&g, (uint32_t)ctx_size)) return 1;
+    if (!laguna_graph_alloc(&g, (uint32_t)ctx_size, ssd_streaming)) return 1;
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     bool ok = true;
     const double prefill_t0 = now_sec();
@@ -50560,6 +50694,7 @@ static int generate_metal_graph_raw_swa(
                                             prompt,
                                             n_predict,
                                             ctx_size,
+                                            ssd_streaming,
                                             emit,
                                             done,
                                             emit_ud,
@@ -55050,6 +55185,10 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
+    if (ds4_session_is_laguna(s) && s->engine->ssd_streaming) {
+        if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
+        return ds4_session_argmax(s);
+    }
     if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
@@ -55508,6 +55647,10 @@ static int ds4_session_eval_splitkv_spec_after_first(
  * 4. fall back to ordinary one-token decode if the fast verifier cannot prove
  *    the target stream. */
 
+#ifndef DS4_NO_GPU
+static bool laguna_stream_context_supported(const ds4_engine *e, int ctx);
+#endif
+
 int ds4_engine_generate_argmax(
         ds4_engine        *e,
         const ds4_tokens  *prompt,
@@ -55529,6 +55672,7 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
+        if (!laguna_stream_context_supported(e, ctx_size)) return 1;
         if (e->multi_tier) {
             ds4_session *s = NULL;
             char err[256] = {0};
@@ -57300,6 +57444,10 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 #endif
 
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
+    if (e->ssd_streaming && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        fprintf(stderr, "ds4: Laguna SSD streaming rejects resident graph diagnostics\n");
+        return 1;
+    }
 #ifndef DS4_NO_GPU
     if (!e->metal_ready) {
         fprintf(stderr, "ds4: %s graph test requested but backend is unavailable\n",
@@ -57319,6 +57467,10 @@ int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt) {
+    if (e->ssd_streaming && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        fprintf(stderr, "ds4: Laguna SSD streaming rejects resident graph diagnostics\n");
+        return 1;
+    }
 #ifndef DS4_NO_GPU
     if (!e->metal_ready) {
         fprintf(stderr, "ds4: %s full graph test requested but backend is unavailable\n",
@@ -57335,6 +57487,10 @@ int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 
 int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size) {
+    if (e->ssd_streaming && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        fprintf(stderr, "ds4: Laguna SSD streaming rejects resident graph diagnostics\n");
+        return 1;
+    }
 #ifndef DS4_NO_GPU
     if (!e->metal_ready) {
         fprintf(stderr, "ds4: %s prompt graph test requested but backend is unavailable\n",
@@ -57449,6 +57605,10 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
+    if (e->ssd_streaming && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        fprintf(stderr, "ds4: Laguna SSD streaming rejects resident graph diagnostics\n");
+        return 1;
+    }
     if (!prompt || prompt->len <= 0) {
         fprintf(stderr, "ds4: first-token test requires a non-empty prompt\n");
         return 1;
@@ -59445,6 +59605,63 @@ int ds4_engine_create_with_gpu_config(ds4_engine **out,
     return ds4_engine_open_internal(out, opt, gpu_cfg);
 }
 
+#ifndef DS4_NO_GPU
+static bool laguna_stream_engine_configure(ds4_engine *e, int context_size) {
+    ds4_gpu_stream_expert_table tables[48];
+    ds4_model_map_span_vec spans = {0};
+    uint64_t entry = 0, non_routed = 0, routed = 0;
+    if (!laguna_stream_expert_tables_make(&e->model, &e->weights, tables, &entry) ||
+        !laguna_stream_model_spans(&e->model, &e->weights, &spans,
+                                    &non_routed, &routed)) {
+        free(spans.v);
+        fprintf(stderr, "ds4: Laguna SSD streaming requires the pinned Q4/Q8 layout\n");
+        return false;
+    }
+    const uint64_t span_bytes = model_map_span_vec_total_bytes(&spans);
+    free(spans.v);
+    const uint32_t ctx = context_size > 0 ? (uint32_t)context_size : 4096u;
+    const uint64_t recommended = ds4_gpu_recommended_working_set_size();
+    const uint64_t available = laguna_stream_available_cache_bytes(
+            recommended, span_bytes, ctx);
+    laguna_stream_cache_config cache;
+    if (!laguna_stream_configure_cache(entry, e->ssd_streaming_cache_experts,
+            e->ssd_streaming_cache_bytes, available, &cache)) {
+        fprintf(stderr, "ds4: Laguna SSD streaming cache budget rejected: "
+                "requires >= 10 experts and spans + cache + KV + scratch + "
+                "1 GiB reserve within 80%% of the Metal working set "
+                "(recommended %.2f GiB, available cache %.2f GiB)\n",
+                (double)recommended / 1073741824.0,
+                (double)available / 1073741824.0);
+        return false;
+    }
+    uint64_t kv = 0, scratch = 0;
+    if (!laguna_stream_graph_bytes(ctx, &kv, &scratch)) return false;
+    e->ssd_streaming_cache_experts = cache.experts;
+    e->ssd_streaming_cache_bytes = cache.payload_bytes;
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(entry);
+    fprintf(stderr, "ds4: Laguna SSD streaming: cache %u experts, %.3f MiB; "
+            "non-routed %.3f MiB, excluded routed %.3f MiB; "
+            "KV %.3f MiB, scratch %.3f MiB, reserve 1024 MiB, ctx=%u\n",
+            cache.experts, (double)cache.payload_bytes / 1048576.0,
+            (double)non_routed / 1048576.0, (double)routed / 1048576.0,
+            (double)kv / 1048576.0, (double)scratch / 1048576.0, ctx);
+    fprintf(stderr, "ds4: Laguna SSD streaming: sequential prefill, "
+            "required Q4 cache; no resident routed fallback\n");
+    return true;
+}
+
+static bool laguna_stream_context_supported(const ds4_engine *e, int ctx) {
+    if (!e->ssd_streaming || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA)
+        return true;
+    if (ctx > 0 && e->ssd_streaming_cache_bytes <=
+            laguna_stream_available_cache_bytes(
+                ds4_gpu_recommended_working_set_size(),
+                e->startup_model_span_bytes, (uint32_t)ctx)) return true;
+    fprintf(stderr, "ds4: Laguna SSD streaming context exceeds the memory budget\n");
+    return false;
+}
+#endif
+
 static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg) {
@@ -59577,6 +59794,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    ds4_str streaming_arch = {0};
+    if (e->ssd_streaming &&
+        model_get_string(&e->model, "general.architecture", &streaming_arch) &&
+        ds4_streq(streaming_arch, "laguna")) {
+        const char *reason = laguna_stream_options_error(opt);
+        if (reason) {
+            fprintf(stderr, "ds4: Laguna SSD streaming rejected: %s\n", reason);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    }
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
     if (e->cuda_tensor_parallel &&
@@ -59635,6 +59864,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
 #endif
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        if (e->ssd_streaming &&
+            !laguna_stream_layout_supported(&e->model, &e->weights)) {
+            fprintf(stderr, "ds4: Laguna SSD streaming requires the pinned "
+                    "uniform routed Q4_K and signal/shared Q8_0 recipe\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         if (opt->inspect_only) {
             *out = e;
             return 0;
@@ -59669,13 +59906,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     ", or --rocm"
 #endif
                     "\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if (e->ssd_streaming) {
-            fprintf(stderr,
-                    "ds4: --ssd-streaming is not implemented for Laguna S 2.1 yet\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -60104,15 +60334,23 @@ static int ds4_engine_open_internal(ds4_engine **out,
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
-        if (!ds4_engine_configure_streaming_auto_cache(e)) {
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if (!ds4_engine_configure_streaming_cache_budget(e)) {
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+        if (e->ssd_streaming && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+            if (!laguna_stream_engine_configure(e, opt->context_size)) {
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+        } else {
+            if (!ds4_engine_configure_streaming_auto_cache(e)) {
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            if (!ds4_engine_configure_streaming_cache_budget(e)) {
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
         }
         if (!ds4_engine_glm_streaming_memory_guard(
                     e,
@@ -60127,7 +60365,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
-        if (e->ssd_streaming) {
+        if (e->ssd_streaming && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) {
             /*
              * Pin the expert cache's slab size class to the model's uniform
              * per-expert bytes, and count mixed-precision (boosted) layers:
@@ -60195,7 +60433,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                     load_output;
             ds4_model_map_span_vec spans;
             bool spans_ok = false;
-            if (load_slice) {
+            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+                /* The non-routed views stay alive for the session; Metal
+                 * resolves their pages on first use. Streaming keeps skipping
+                 * residency and warmup: they are not needed for correctness,
+                 * and a global request here would also have to tell future
+                 * remaps apart. First use may therefore take page faults. */
+                uint64_t non_routed = 0, routed = 0;
+                spans_ok = laguna_stream_model_spans(&e->model, &e->weights,
+                        &spans, &non_routed, &routed);
+            } else if (load_slice) {
                 spans_ok = weights_model_map_decode_static_slice_spans(
                         &e->weights,
                         load_layer_start,
@@ -60224,7 +60471,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
             load_sizes = sizes;
             load_span_count = spans.len;
             e->startup_model_span_bytes = span_bytes;
-            if (load_slice) {
+            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+                fprintf(stderr, "ds4: Laguna SSD streaming: installing %u "
+                        "non-routed spans (%.3f MiB); full-model residency disabled\n",
+                        spans.len, (double)span_bytes / 1048576.0);
+            } else if (load_slice) {
                 char load_end[32];
                 if (map_output && load_layer_end == UINT32_MAX) {
                     snprintf(load_end, sizeof(load_end), "output");
@@ -60253,6 +60504,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                                         load_sizes,
                                                         load_span_count,
                                                         spans.max_tensor_bytes);
+            if (model_map_ok && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA)
+                fprintf(stderr, "ds4: Laguna SSD streaming: non-routed spans installed\n");
             free(spans.v);
         } else if (load_slice) {
             const bool map_output = load_output;
@@ -60769,10 +61022,19 @@ void ds4_engine_close(ds4_engine *e) {
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
+#ifndef DS4_NO_GPU
+    const bool laguna_streaming =
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA && e->ssd_streaming;
+    /* Consumers and the cache must finish before munmap/close. */
+    if (laguna_streaming) {
+        ds4_gpu_cleanup();
+        ds4_gpu_set_streaming_expert_cache_expert_bytes(0);
+    }
+#endif
     if (e->mtp_model.map) model_close(&e->mtp_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
-    ds4_gpu_cleanup();
+    if (!laguna_streaming) ds4_gpu_cleanup();
 #endif
     if (e->dflash_f16_map && e->dflash_f16_map_size != 0) {
         munmap(e->dflash_f16_map, (size_t)e->dflash_f16_map_size);
@@ -60946,12 +61208,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     return 1;
 #else
     if (!ds4_backend_uses_graph(e->backend) || !e->metal_ready) return 1;
+    if (!laguna_stream_context_supported(e, ctx_size)) return 1;
 
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
-        if (!laguna_graph_alloc(&s->laguna_graph, (uint32_t)ctx_size)) {
+        if (!laguna_graph_alloc(&s->laguna_graph, (uint32_t)ctx_size,
+                                e->ssd_streaming)) {
             free(s);
             return 1;
         }
@@ -62561,6 +62825,10 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                            s->display_progress,
                                            s->display_progress_ud,
                                            prompt->len);
+            if (ok && s->laguna_graph.ssd_streaming && s->display_progress) {
+                s->display_progress(s->display_progress_ud, "prefill_display",
+                                    i + (int)n, prompt->len);
+            }
             if (!ok) {
                 snprintf(err, errlen,
                          "%s Laguna prefill failed at token %d",
@@ -69083,6 +69351,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+    if (ds4_session_is_laguna(s) && s->engine->ssd_streaming) {
+        snprintf(err, errlen, "Laguna SSD streaming does not support speculative decoding");
+        return -1;
+    }
     if (s->distributed) {
         if (!accepted) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
