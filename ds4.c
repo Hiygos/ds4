@@ -49928,6 +49928,21 @@ static bool laguna_graph_capture_final_feature(
     return ok;
 }
 
+static bool laguna_graph_forward_decode_token(
+        ds4_laguna_gpu_graph *g,
+        const ds4_model      *model,
+        const ds4_weights    *weights,
+        int                   token,
+        uint32_t              pos,
+        const ds4_laguna_feature_capture *capture,
+        float                *logits_out) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (g && g->ssd_streaming) ds4_gpu_laguna_stream_note_decode_row();
+#endif
+    return laguna_graph_forward_token(g, model, weights, token, pos,
+                                      capture, logits_out);
+}
+
 static bool laguna_graph_forward_batch(
         ds4_laguna_gpu_graph *g,
         const ds4_model      *model,
@@ -50654,7 +50669,7 @@ static int generate_laguna_metal_argmax(
         if (emit) emit(emit_ud, token);
         generated++;
         if (i + 1 == n_predict || pos + 1u >= (uint32_t)ctx_size) break;
-        ok = laguna_graph_forward_token(
+        ok = laguna_graph_forward_decode_token(
             &g, model, weights, token, pos, NULL, logits);
         pos++;
     }
@@ -64625,13 +64640,13 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             }
             capture.dst_row0 = s->dflash_deferred_rows;
         }
-        if (!laguna_graph_forward_token(&s->laguna_graph,
-                                        &e->model,
-                                        &e->weights,
-                                        token,
-                                        (uint32_t)s->checkpoint.len,
-                                        dflash_enabled ? &capture : NULL,
-                                        s->logits)) {
+        if (!laguna_graph_forward_decode_token(&s->laguna_graph,
+                                               &e->model,
+                                               &e->weights,
+                                               token,
+                                               (uint32_t)s->checkpoint.len,
+                                               dflash_enabled ? &capture : NULL,
+                                               s->logits)) {
             if (errlen) snprintf(err, errlen, "%s Laguna decode failed",
                                  ds4_backend_name(e->backend));
             s->checkpoint_valid = false;

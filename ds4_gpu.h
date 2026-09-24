@@ -2345,6 +2345,8 @@ typedef struct {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
 /* Synchronous top-10 Q4 consumer. Cache is required; never maps routed weights. */
 void ds4_gpu_laguna_stream_set_record_row_index(uint32_t row_index);
+/* Advance route-hotness decay once for each Laguna streaming decode row. */
+void ds4_gpu_laguna_stream_note_decode_row(void);
 int ds4_gpu_laguna_stream_routed_moe_one_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *mid,
         const void *model_map, uint64_t model_size,

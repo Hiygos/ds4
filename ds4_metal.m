@@ -12029,11 +12029,9 @@ void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 
 static void ds4_gpu_stream_expert_cache_maybe_decay_route_hotness(void) {
     if (g_stream_expert_cache_decode_tokens == 0) return;
-    if (g_stream_expert_cache_hotness_decay_token == 0) {
-        g_stream_expert_cache_hotness_decay_token =
-            g_stream_expert_cache_decode_tokens;
-        return;
-    }
+    // The clock starts at zero and the reset realigns it to the current
+    // counter, so it must not be initialized here (that would push the first
+    // halving to row 17 instead of 16).
     while (g_stream_expert_cache_decode_tokens -
            g_stream_expert_cache_hotness_decay_token >=
            DS4_METAL_STREAM_EXPERT_HOTNESS_DECAY_TOKENS) {
@@ -12117,6 +12115,10 @@ static void ds4_gpu_stream_expert_cache_note_decode_token(void) {
     }
     g_stream_expert_cache_decode_tokens++;
     ds4_gpu_stream_expert_cache_maybe_decay_route_hotness();
+}
+
+void ds4_gpu_laguna_stream_note_decode_row(void) {
+    ds4_gpu_stream_expert_cache_note_decode_token();
 }
 
 static int ds4_gpu_stream_compact_addr_requested(void) {
