@@ -342,6 +342,10 @@ static uint64_t g_laguna_stream_wait_calls;
 static uint64_t g_laguna_stream_token_rows, g_laguna_stream_moe_calls;
 static uint64_t g_laguna_stream_failures;
 static double g_laguna_stream_wait_before_ms, g_laguna_stream_wait_after_ms;
+static uint32_t g_laguna_stream_record_row_index;
+static int g_laguna_selected_trace_record_initialized;
+static FILE *g_laguna_selected_trace_record_fp;
+static uint64_t g_laguna_selected_trace_record_count;
 static uint64_t g_stream_expert_cache_hits;
 static uint64_t g_stream_expert_cache_misses;
 static uint64_t g_stream_expert_cache_evictions;
@@ -1513,6 +1517,78 @@ static int ds4_gpu_moe_selected_trace_record(
     }
     g_moe_selected_trace_record_count++;
     return 1;
+}
+
+static void ds4_gpu_laguna_selected_trace_record_close(void) {
+    if (!g_laguna_selected_trace_record_fp) return;
+    const char *path = getenv("DS4_LAGUNA_RECORD_SELECTED_IDS");
+    if (fflush(g_laguna_selected_trace_record_fp) != 0) {
+        fprintf(stderr, "ds4: failed to flush Laguna selected-id record file %s\n",
+                path && path[0] ? path : "(unknown)");
+    }
+    if (fclose(g_laguna_selected_trace_record_fp) != 0) {
+        fprintf(stderr, "ds4: failed to close Laguna selected-id record file %s\n",
+                path && path[0] ? path : "(unknown)");
+    }
+    g_laguna_selected_trace_record_fp = NULL;
+    g_laguna_selected_trace_record_initialized = 0;
+    fprintf(stderr,
+            "ds4: recorded %" PRIu64 " Laguna routed-MoE selected-id records to %s\n",
+            g_laguna_selected_trace_record_count,
+            path && path[0] ? path : "(unknown)");
+    g_laguna_selected_trace_record_count = 0;
+}
+
+static void ds4_gpu_i32_store_le(uint8_t dst[4], int32_t value) {
+    const uint32_t bits = (uint32_t)value;
+    dst[0] = (uint8_t)bits;
+    dst[1] = (uint8_t)(bits >> 8);
+    dst[2] = (uint8_t)(bits >> 16);
+    dst[3] = (uint8_t)(bits >> 24);
+}
+
+static int ds4_gpu_laguna_selected_trace_record(
+        uint32_t layer_index,
+        const int32_t selected_ids[DS4_STREAM_Q4_MAX_SELECTED],
+        uint32_t n_selected) {
+    const char *path = getenv("DS4_LAGUNA_RECORD_SELECTED_IDS");
+    if (!path || !path[0]) return 1;
+    if (n_selected != DS4_STREAM_Q4_MAX_SELECTED ||
+        layer_index > INT32_MAX || g_laguna_stream_record_row_index > INT32_MAX) {
+        fprintf(stderr, "ds4: Laguna selected-id recording requires int32 row/layer and top-10\n");
+        return 0;
+    }
+    if (!g_laguna_selected_trace_record_initialized) {
+        g_laguna_selected_trace_record_initialized = 1;
+        g_laguna_selected_trace_record_fp = fopen(path, "wb");
+        if (!g_laguna_selected_trace_record_fp) {
+            g_laguna_selected_trace_record_initialized = 0;
+            fprintf(stderr, "ds4: failed to open Laguna selected-id record file %s\n", path);
+            return 0;
+        }
+        setvbuf(g_laguna_selected_trace_record_fp, NULL, _IOFBF, 1u << 20);
+        atexit(ds4_gpu_laguna_selected_trace_record_close);
+    }
+
+    /* An explicit little-endian format keeps the file host-independent. */
+    uint8_t record[(3u + DS4_STREAM_Q4_MAX_SELECTED) * sizeof(int32_t)];
+    ds4_gpu_i32_store_le(record, (int32_t)layer_index);
+    ds4_gpu_i32_store_le(record + 4, (int32_t)g_laguna_stream_record_row_index);
+    ds4_gpu_i32_store_le(record + 8, (int32_t)n_selected);
+    for (uint32_t i = 0; i < n_selected; i++) {
+        ds4_gpu_i32_store_le(record + (3u + i) * 4u, selected_ids[i]);
+    }
+    if (fwrite(record, 1, sizeof(record), g_laguna_selected_trace_record_fp) !=
+        sizeof(record)) {
+        fprintf(stderr, "ds4: failed to write Laguna selected-id record file %s\n", path);
+        return 0;
+    }
+    g_laguna_selected_trace_record_count++;
+    return 1;
+}
+
+void ds4_gpu_laguna_stream_set_record_row_index(uint32_t row_index) {
+    g_laguna_stream_record_row_index = row_index;
 }
 
 static int ds4_gpu_moe_selected_trace_replay(
@@ -9282,6 +9358,7 @@ void ds4_gpu_cleanup(void) {
                     g_stream_expert_cache_slab_count, g_stream_expert_cache_slab_total_slots,
                     (unsigned long long)g_laguna_stream_allocated_bytes);
         }
+        ds4_gpu_laguna_selected_trace_record_close();
         ds4_gpu_stream_expert_pread_pool_shutdown();
         if (g_laguna_stream_cache_used) ds4_gpu_laguna_stream_reset();
         ds4_gpu_stream_expert_cache_clear_all(1);
@@ -34993,6 +35070,13 @@ static int ds4_gpu_glm_routed_moe_one_tensor_impl(
                         ds4_gpu_stream_expert_cache_configured_budget(),
                         stream_selected_ids)) {
                 fprintf(stderr, "ds4: Metal Laguna streaming invalid top-10 selection or budget\n");
+                stream_ok = 0;
+            }
+            /* The IDs are already on the host after the existing readback/sync
+             * above. */
+            if (stream_ok && require_cache &&
+                !ds4_gpu_laguna_selected_trace_record(
+                    layer_index, stream_selected_ids, n_expert)) {
                 stream_ok = 0;
             }
             for (uint32_t i = 0; stream_ok && i < n_expert; i++) {

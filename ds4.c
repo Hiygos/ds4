@@ -49674,6 +49674,7 @@ static bool laguna_graph_forward_token(
             } else if (ok) {
                 if (g->ssd_streaming) {
 #if defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NATIVE_CUDA_BUILD)
+                    ds4_gpu_laguna_stream_set_record_row_index(pos);
                     ok = ds4_gpu_laguna_stream_routed_moe_one_tensor(
                             g->ffn_out, g->routed_mid, model->map, model->size,
                             &routed_moe, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
