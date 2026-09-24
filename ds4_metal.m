@@ -21,6 +21,7 @@
 
 #include "ds4.h"
 #include "ds4_gpu.h"
+#include "ds4_stream_q4.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -557,7 +558,7 @@ static uint32_t g_model_view_count;
 enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT = 384,
-    DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED = DS4_METAL_MAX_ROUTED_EXPERT_USED,
+    DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED = DS4_STREAM_Q4_MAX_SELECTED,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES =
         DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER *
         DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT,
@@ -10493,12 +10494,19 @@ int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     return 1;
 }
 
+#ifdef DS4_TEST_HOOKS
+static uint64_t g_test_model_range_calls;
+#endif
+
 static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const void *model_map,
         uint64_t    model_size,
         uint64_t    offset,
         uint64_t    len,
         uint64_t   *inner_offset) {
+#ifdef DS4_TEST_HOOKS
+    g_test_model_range_calls++;
+#endif
     (void)model_map;
     if (model_size == 0 || offset > model_size || len > model_size - offset) {
         fprintf(stderr, "ds4: Metal model range is outside the mapped model\n");
@@ -12136,12 +12144,12 @@ static int ds4_gpu_stream_selected_ids_prepare(
         !selected_off ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         n_selected == 0 ||
-        n_selected > DS4_METAL_MAX_ROUTED_EXPERT_USED) {
+        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED) {
         return 0;
     }
 
     const NSUInteger bytes =
-        (NSUInteger)DS4_METAL_MAX_ROUTED_EXPERT_USED * sizeof(int32_t);
+        (NSUInteger)DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * sizeof(int32_t);
     id<MTLBuffer> b = g_stream_selected_id_buffers[layer];
     if (!b) {
         b = [g_device newBufferWithLength:bytes
@@ -12154,7 +12162,7 @@ static int ds4_gpu_stream_selected_ids_prepare(
         g_stream_selected_id_buffers[layer] = b;
     }
 
-    int32_t ids[DS4_METAL_MAX_ROUTED_EXPERT_USED] = {0};
+    int32_t ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {0};
     memcpy(ids, selected_ids, (size_t)n_selected * sizeof(ids[0]));
     memcpy([b contents], ids, bytes);
     [b didModifyRange:NSMakeRange(0, bytes)];
@@ -34589,7 +34597,7 @@ static bool ds4_gpu_glm_down_type_supported(uint32_t down_type) {
            down_type == DS4_METAL_TENSOR_Q6_K;
 }
 
-int ds4_gpu_glm_routed_moe_one_tensor(
+static int ds4_gpu_glm_routed_moe_one_tensor_impl(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
         const void             *model_map,
@@ -34615,7 +34623,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         uint32_t                n_expert,
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
-        bool                    force_resident) {
+        bool                    force_resident,
+        bool                    require_cache) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* TP sharding: only the owned contiguous expert range is mapped,
      * so bind from the owned base, validate only its bytes, and tell the
@@ -34716,20 +34725,22 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             (stream_addr_q2 || stream_addr_q4) &&
             layer_index < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
             n_total_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
-            n_expert <= 8u &&
+            n_expert <= (require_cache ? DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED : 8u) &&
             ds4_gpu_stream_expert_cache_configured_budget() >= n_expert &&
             ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
                                                          down_expert_bytes) &&
             ds4_gpu_stream_expert_cache_effective_cap(layer_index,
                                                       n_total_expert,
                                                       n_expert) != 0;
-        int32_t stream_selected_ids[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        ds4_gpu_stream_expert_cache_entry *stream_entries[8] = {
-            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
-        };
-        uint64_t stream_gate_abs_offsets[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        uint64_t stream_up_abs_offsets[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        uint64_t stream_down_abs_offsets[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (require_cache && !use_stream_expert_addr_table) {
+            fprintf(stderr, "ds4: Metal Laguna streaming requires the Q4 expert cache\n");
+            return 0;
+        }
+        int32_t stream_selected_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {0};
+        ds4_gpu_stream_expert_cache_entry *stream_entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {NULL};
+        uint64_t stream_gate_abs_offsets[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {0};
+        uint64_t stream_up_abs_offsets[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {0};
+        uint64_t stream_down_abs_offsets[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {0};
         uint32_t stream_missing_mask = 0;
         uint32_t stream_entry_count = 0;
         uint32_t stream_resident_mask = 0;
@@ -34744,6 +34755,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             const int had_batch = g_batch_cb != nil;
             int stream_ok = 1;
             const int have_prefetched_selected =
+                !require_cache &&
                 ds4_gpu_glm_stream_selected_prefetch_take(model_map,
                                                           model_size,
                                                           layer_index,
@@ -34772,6 +34784,16 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                                         (uint64_t)n_expert * sizeof(stream_selected_ids[0])) == 0) {
                     stream_ok = 0;
                 }
+            }
+            if (stream_ok && require_cache &&
+                !ds4_stream_q4_selection_valid(
+                        model_size, gate_offset, up_offset, down_offset,
+                        gate_expert_bytes, down_expert_bytes,
+                        n_total_expert, n_expert,
+                        ds4_gpu_stream_expert_cache_configured_budget(),
+                        stream_selected_ids)) {
+                fprintf(stderr, "ds4: Metal Laguna streaming invalid top-10 selection or budget\n");
+                stream_ok = 0;
             }
             for (uint32_t i = 0; stream_ok && i < n_expert; i++) {
                 if (stream_selected_ids[i] < 0 ||
@@ -34840,6 +34862,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                             stream_missing_mask);
                 }
                 use_stream_split_deferred =
+                    !require_cache &&
                     stream_ok &&
                     getenv("DS4_METAL_DISABLE_GLM_STREAMING_EXPERT_SPLIT") == NULL &&
                     stream_missing_mask != 0 &&
@@ -35310,6 +35333,84 @@ int ds4_gpu_glm_routed_moe_one_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_glm_routed_moe_one_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                up_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                up_expert_bytes,
+        uint64_t                up_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        uint32_t                layer_index,
+        const ds4_gpu_tensor *x,
+        bool                    force_resident) {
+    return ds4_gpu_glm_routed_moe_one_tensor_impl(
+        out, mid, model_map, model_size, gate_offset, up_offset, down_offset,
+        gate_type, up_type, down_type, gate_expert_bytes, gate_row_bytes,
+        up_expert_bytes, up_row_bytes, down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+        n_total_expert, n_expert, layer_index, x, force_resident, false);
+}
+
+int ds4_gpu_laguna_stream_routed_moe_one_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *mid,
+        const void *model_map, uint64_t model_size,
+        const ds4_gpu_laguna_moe_desc *routed,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, uint32_t layer_index,
+        const ds4_gpu_tensor *x) {
+    if (!routed || !g_ssd_streaming_mode || g_model_fd < 0 ||
+        g_tp_split_world > 1 ||
+        g_stream_expert_pending_load.active ||
+        n_expert != DS4_STREAM_Q4_MAX_SELECTED ||
+        ds4_gpu_stream_expert_cache_configured_budget() < n_expert ||
+        routed->gate_type != DS4_METAL_TENSOR_Q4_K ||
+        routed->up_type != DS4_METAL_TENSOR_Q4_K ||
+        routed->down_type != DS4_METAL_TENSOR_Q4_K ||
+        routed->gate_expert_bytes != routed->up_expert_bytes ||
+        routed->gate_row_bytes != (uint64_t)(expert_in_dim / 256u) * 144u ||
+        routed->up_row_bytes != routed->gate_row_bytes ||
+        routed->down_row_bytes != (uint64_t)(expert_mid_dim / 256u) * 144u) {
+        fprintf(stderr, "ds4: Metal Laguna streaming requires uniform Q4, top-10, "
+                        "a model fd, cache budget >= 10 and no pending load or TP\n");
+        return 0;
+    }
+    /* Complete the router and all previous consumers before cache reuse. */
+    const int had_batch = g_batch_cb != nil;
+    if (!ds4_gpu_synchronize()) return 0;
+    int ok = ds4_gpu_glm_routed_moe_one_tensor_impl(
+        out, mid, model_map, model_size,
+        routed->gate_offset, routed->up_offset, routed->down_offset,
+        routed->gate_type, routed->up_type, routed->down_type,
+        routed->gate_expert_bytes, routed->gate_row_bytes,
+        routed->up_expert_bytes, routed->up_row_bytes,
+        routed->down_expert_bytes, routed->down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+        n_total_expert, n_expert, layer_index, x, false, true);
+    /* Drain even on failure; no selection may outlive this call. */
+    if (!ds4_gpu_synchronize()) ok = 0;
+    if (had_batch && !ds4_gpu_begin_commands()) ok = 0;
+    if (!ok) fprintf(stderr, "ds4: Metal Laguna streaming Q4 consumer failed\n");
+    return ok;
 }
 
 int ds4_gpu_laguna_routed_shared_moe_one_tensor(
@@ -36384,7 +36485,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             (stream_addr_q2 || stream_addr_q4) &&
             layer_index < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
             n_total_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
-            n_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED &&
+            n_expert <= DS4_METAL_MAX_ROUTED_EXPERT_USED &&
             ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
                                                          down_expert_bytes) &&
             ds4_gpu_stream_expert_cache_effective_cap(layer_index,

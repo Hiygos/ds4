@@ -2342,6 +2342,18 @@ typedef struct {
     uint64_t down_row_bytes;
 } ds4_gpu_laguna_moe_desc;
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Synchronous top-10 Q4 consumer. Cache is required; never maps routed weights. */
+int ds4_gpu_laguna_stream_routed_moe_one_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *mid,
+        const void *model_map, uint64_t model_size,
+        const ds4_gpu_laguna_moe_desc *routed,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, uint32_t layer_index,
+        const ds4_gpu_tensor *x);
+#endif
+
 /* Decode-only Laguna path. Routed and shared experts use independent thread
  * groups in two common dispatches, preserving each projection's arithmetic. */
 int ds4_gpu_laguna_routed_shared_moe_one_tensor(

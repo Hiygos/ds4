@@ -240,7 +240,7 @@ ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
 ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
 
-ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
+ds4_metal.o: ds4_metal.m ds4_gpu.h ds4_stream_q4.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc \
@@ -402,5 +402,18 @@ q4k-dot-test: tests/test_q4k_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
 	./tests/test_q4k_dot
 
+tests/test_laguna_stream_q4: tests/test_laguna_stream_q4.c tests/laguna_stream_q4_fixture.h ds4_stream_q4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -I. -o $@ $< $(LDLIBS)
+
+.PHONY: laguna-stream-q4-host-test
+laguna-stream-q4-host-test: tests/test_laguna_stream_q4
+	./tests/test_laguna_stream_q4
+
+ifeq ($(UNAME_S),Darwin)
+tests/test_metal_laguna_stream_q4: tests/test_metal_laguna_stream_q4.m tests/laguna_stream_q4_fixture.h ds4_metal.m ds4_stream_q4.h ds4_gpu.h $(METAL_SRCS) $(filter-out ds4_metal.o,$(CORE_OBJS))
+	$(CC) $(OBJCFLAGS) -I. -o $@ $< $(filter-out ds4_metal.o,$(CORE_OBJS)) $(METAL_LDLIBS)
+endif
+
 clean:
+	rm -f tests/test_laguna_stream_q4 tests/test_metal_laguna_stream_q4
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
